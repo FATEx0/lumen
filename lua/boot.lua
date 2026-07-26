@@ -208,6 +208,10 @@ if have_cloudredirect then
 end
 
 local lua_dir = os.getenv("LUMEN_LUA_DIR") or "lua"
+local gamepad_toast_js = utils.read_file(lua_dir .. "/gamepad-toasts.js")
+if not gamepad_toast_js then
+  io.stderr:write("[lumen] WARN: gamepad toast bridge not found\n")
+end
 
 -- The Lumen settings menu used to be one ~1.2k-line lumen_menu.js. It's now
 -- split into ordered source fragments under menu/ (one concern per file) for
@@ -289,6 +293,8 @@ offers_assets = {
   css = {},
   js = parental_unlock_enabled and { SPECIAL_OFFERS_UNLOCK_JS } or {},
 }
+local notifyqueue = require("notifyqueue")
+local next_notify_poll = 0
 loop.run({
   registry = registry,
   on_steam_returned = refresh_parental_unlock,
@@ -296,9 +302,17 @@ loop.run({
     { urls = { "store.steampowered.com/marketingmessages/list" }, assets = offers_assets },
     { urls = { "store.steampowered.com", "steamcommunity.com" }, assets = webview_assets },
     { titles = { ["Steam"] = true }, assets = build_menu_assets() },
-    -- Control-only link to SharedJSContext (NO assets injected): the only context
-    -- with SteamClient. Used to relay SteamClient.Apps.SetAppLaunchOptions on
-    -- behalf of the store-page online-fix flow (which can't reach SteamClient).
-    { titles = { ["SharedJSContext"] = true }, control = true },
+    -- Control link to the only context with SteamClient. The tiny toast bridge
+    -- also renders queued service alerts inside Gamepad UI.
+    { titles = { ["SharedJSContext"] = true }, control = true,
+      assets = { polyfill = nil, css = {},
+        js = gamepad_toast_js and { gamepad_toast_js } or {} } },
   },
+  on_tick = function(inj, now)
+    if now < next_notify_poll then return end
+    next_notify_poll = now + 0.25
+    local events = notifyqueue.drain()
+    if not inj:is_gamepad_ui() then return end
+    for _, event in ipairs(events) do inj:show_gamepad_toast(event) end
+  end,
 })
