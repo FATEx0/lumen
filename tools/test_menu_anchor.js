@@ -249,4 +249,91 @@ if (!late.btn) {
 }
 console.log("ok   [late]: button anchored after a late-rendering menubar");
 
+// ── observer-driven anchor (no waiting for the retry timer) ──────────────────
+// When injection lands just before the menubar paints, waiting out the 1s retry
+// is what delays the button. A document observer must anchor on the mutation
+// that renders the menubar, without any timer firing — and must then disconnect.
+function runObserverMenu(labels) {
+  const root = new El("div");
+  const head = new El("div"); root.appendChild(head);
+  const body = new El("div"); root.appendChild(body);
+  const titlebar = new El("div"); body.appendChild(titlebar);
+
+  const timers = [];
+  const observers = [];
+  const ctx = {
+    window: {},
+    document: makeDocument(root, head, body),
+    location: { hostname: "steamloopback.host" },
+    navigator: { language: "en" },
+    console: { log() {} },
+    setTimeout: (fn) => { timers.push(fn); return timers.length; },
+    clearTimeout: () => {},
+    MutationObserver: class {
+      constructor(cb) { this.cb = cb; this.disconnected = false; observers.push(this); }
+      observe() { this.observing = true; }
+      disconnect() { this.disconnected = true; this.observing = false; }
+    },
+  };
+  vm.createContext(ctx);
+  vm.runInContext(SOURCE, ctx, { filename: "lumen_menu.js" });
+
+  const docObservers = observers.filter((o) => o.observing);
+  const timersBefore = timers.length;
+
+  // The menubar renders; the observer fires for that mutation batch.
+  const menubar = new El("div");
+  labels.forEach((label, idx) => {
+    const wrap = new El("div");
+    if (idx === 0) {
+      const inner = new El("div");
+      inner.appendChild(new El("div"));
+      inner.appendText(label);
+      wrap.appendChild(inner);
+    } else {
+      const leaf = new El("div"); leaf.textContent = label; wrap.appendChild(leaf);
+    }
+    menubar.appendChild(wrap);
+  });
+  titlebar.appendChild(menubar);
+
+  // Other fragments install their own document observers, so identify the
+  // menubar's by behaviour: the one whose callback anchors the button.
+  let anchoredBy = null;
+  for (const o of docObservers) {
+    if (findById(root, "lumen-moon-btn")) break;
+    o.cb([], o);
+    if (findById(root, "lumen-moon-btn")) { anchoredBy = o; break; }
+  }
+
+  return {
+    btn: findById(root, "lumen-moon-btn"),
+    menubar,
+    hadDocObserver: anchoredBy !== null,
+    hadPendingTimer: timersBefore > 0,
+    docObserverDisconnected: anchoredBy !== null && anchoredBy.disconnected,
+  };
+}
+
+const obs = runObserverMenu(LANGS.en);
+if (!obs.hadDocObserver) {
+  console.error("FAIL [observer]: no document observer anchored the button on a mutation");
+  process.exit(1);
+}
+if (!obs.btn || !obs.menubar.contains(obs.btn)) {
+  console.error("FAIL [observer]: mutation did not anchor the button in the menubar");
+  process.exit(1);
+}
+// No queued timer callback is ever executed in this scenario, so the anchor can
+// only have come from the mutation: the retry timer is still pending.
+if (!obs.hadPendingTimer) {
+  console.error("FAIL [observer]: the retry timer should still be pending (nothing ran it)");
+  process.exit(1);
+}
+if (!obs.docObserverDisconnected) {
+  console.error("FAIL [observer]: document observer kept scanning after anchoring");
+  process.exit(1);
+}
+console.log("ok   [observer]: menubar mutation anchors immediately, then stops scanning");
+
 console.log("\nall ok");

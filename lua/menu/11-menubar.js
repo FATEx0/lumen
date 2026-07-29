@@ -92,31 +92,78 @@
     try { observer.observe(bar, { childList: true }); } catch (e) {}
   }
 
+  // One anchor attempt. Returns true once the button is in the menubar.
+  function attemptAnchor() {
+    window.__lumenAnchorAttempts = (window.__lumenAnchorAttempts || 0) + 1;
+    if (document.getElementById(BTN_ID)) return true;
+    var f = findMenubar();
+    window.__lumenLastFind = f ? "found" : "null";
+    if (!f) return false;
+    ensureButton(f);
+    startObserver(f.bar);
+    stopDocObserver();
+    log("anchored full-moon button");
+    // Steam has finished loading (the menubar exists): this is the moment to
+    // check whether slsteam-moon actually injected, and warn if it didn't.
+    maybeWarnSlsNotLoaded();
+    return true;
+  }
+
+  // While unanchored, watch the document for the menubar being rendered instead
+  // of only waiting out the retry timer below: when injection lands just before
+  // the menubar paints, that timer is what makes the button appear up to a full
+  // second late (measured 1.5-1.6 s attach->button in 2 of 13 boots). findMenubar
+  // is a whole-document scan, so it is throttled — never more than one scan per
+  // DOC_SCAN_THROTTLE_MS — to avoid loading the renderer while it paints. The
+  // observer disconnects the moment the button is anchored (or retries give up).
+  var docObserver = null, lastDocScan = 0, docScanPending = false;
+  var DOC_SCAN_THROTTLE_MS = 200;
+
+  function stopDocObserver() {
+    if (!docObserver) return;
+    try { docObserver.disconnect(); } catch (e) {}
+    docObserver = null;
+  }
+
+  function docScan() {
+    docScanPending = false;
+    lastDocScan = Date.now();
+    attemptAnchor();
+  }
+
+  function startDocObserver() {
+    if (docObserver || typeof MutationObserver !== "function") return;
+    docObserver = new MutationObserver(function () {
+      if (docScanPending) return;
+      if (document.getElementById(BTN_ID)) { stopDocObserver(); return; }
+      var since = Date.now() - lastDocScan;
+      if (since >= DOC_SCAN_THROTTLE_MS) { docScan(); return; }
+      docScanPending = true;
+      setTimeout(docScan, DOC_SCAN_THROTTLE_MS - since);
+    });
+    try {
+      docObserver.observe(document.documentElement, { childList: true, subtree: true });
+    } catch (e) { docObserver = null; }
+  }
+
   // Anchor with retries. The menubar may not exist at first paint, and on a
   // COLD Steam start it can take well over 30s to render/stabilize — the menu
   // script is injected early. We retry fast for the first ~30s, then slower for
   // a few minutes, until the menubar appears. (The old code gave up after ~30s
   // and the re-add observer only starts AFTER a successful find, so a late
   // menubar left the button missing — the "button gone after restart" bug.)
+  // The retry timer remains the guaranteed path; the observer above only makes
+  // the common case faster.
   var attempts = 0;
   var MAX_ATTEMPTS = 150; // ~30s fast + ~4min slow; the shell always shows one
   function tryAnchor() {
-    window.__lumenAnchorAttempts = (window.__lumenAnchorAttempts || 0) + 1;
-    if (document.getElementById(BTN_ID)) return;
-    var f = findMenubar();
-    window.__lumenLastFind = f ? "found" : "null";
-    if (f) {
-      ensureButton(f);
-      startObserver(f.bar);
-      log("anchored full-moon button");
-      // Steam has finished loading (the menubar exists): this is the moment to
-      // check whether slsteam-moon actually injected, and warn if it didn't.
-      maybeWarnSlsNotLoaded();
-      return;
-    }
+    if (attemptAnchor()) return;
     attempts++;
     if (attempts <= MAX_ATTEMPTS) setTimeout(tryAnchor, attempts <= 30 ? 1000 : 2000);
-    else log("menubar not found after extended wait; giving up (graceful)");
+    else {
+      log("menubar not found after extended wait; giving up (graceful)");
+      stopDocObserver();
+    }
   }
 
   // Only anchor the menubar button in the main client shell. This script is
@@ -129,6 +176,7 @@
   if (__lumenHost === "store.steampowered.com" || __lumenHost === "steamcommunity.com") {
     log("web view (" + __lumenHost + "): overlay-only, no menubar button");
   } else {
+    startDocObserver();
     tryAnchor();
   }
   log("loaded");
