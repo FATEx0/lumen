@@ -46,9 +46,8 @@ do
   local injector_pos = source:find("inj:tick()", 1, true)
   assert_true(lifecycle_pos and injector_pos and lifecycle_pos < injector_pos,
     "Steam return refresh runs before injector gateway synchronization")
-  assert_true(source:find("inj:needs_fast_tick()", 1, true)
-      and source:find("0.01", 1, true),
-    "loop polls quickly only while an asynchronous browser request is pending")
+  assert_true(source:find("inj:poll_timeout()", 1, true),
+    "loop takes its blocking timeout from the injector's cadence")
 end
 
 local SAMPLE = {
@@ -339,6 +338,36 @@ do
   state.conns.example = { requests = { document = {} } }
   assert_true(state:needs_fast_tick() == true,
     "injector requests a fast cadence only during a pending browser request")
+
+  -- Discovery cadence: pre-attach failures are expected (Steam has not opened
+  -- the endpoint yet), so they must not arm a doubling backoff that blinds the
+  -- sidecar for seconds while Steam is already painting. The backoff survives
+  -- only for post-injection reconnects.
+  assert_true(injector.DISCOVER_INTERVAL >= 0.25
+      and injector.DISCOVER_INTERVAL <= 0.5,
+    "pre-attach discovery polls between 250 and 500 ms")
+  assert_true(injector.next_retry_delay(false, 8) == injector.DISCOVER_INTERVAL,
+    "pre-attach retry ignores any armed backoff")
+  assert_true(injector.grow_backoff(false, 1) == 1
+      and injector.grow_backoff(false, 8) == 1,
+    "pre-attach failures never grow the backoff")
+  assert_true(injector.grow_backoff(true, 1) == 2
+      and injector.grow_backoff(true, 2) == 4
+      and injector.grow_backoff(true, 8) == 15
+      and injector.grow_backoff(true, 15) == injector.RECONNECT_BACKOFF_MAX,
+    "post-attach reconnects keep the doubling backoff and its cap")
+  assert_true(injector.next_retry_delay(true, 4) == 4,
+    "post-attach retry honours the backoff")
+
+  local cadence = injector.new({ channels = {} })
+  assert_true(cadence:poll_timeout() == injector.DISCOVER_INTERVAL,
+    "the loop wakes at the discovery cadence until the first attach")
+  cadence.attached_once = true
+  assert_true(cadence:poll_timeout() == 1,
+    "once attached the loop returns to the idle second")
+  cadence.conns.example = { requests = { document = {} } }
+  assert_true(cadence:poll_timeout() == 0.01,
+    "a pending browser request still wins the fast cadence")
 
   local old_closed = false
   state.ui_ready = true

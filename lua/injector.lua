@@ -111,11 +111,24 @@ io.stdout:setvbuf("no")
 -- slsteam-moon not active). Re-read each call (the file is tiny) so a port
 -- rotation on a webhelper restart is picked up; we only log on change.
 local g_logged_port = nil
+local g_logged_stale = false
 local function cef_port()
-  local p, from_file = cefport.resolve(cefport.read_contract, cefport.FALLBACK)
-  if from_file and p ~= g_logged_port then
-    log("CEF port (from contract file): " .. p)
-    g_logged_port = p
+  local p, from_file, reason = cefport.resolve(cefport.read_contract, cefport.FALLBACK)
+  if from_file then
+    g_logged_stale = false
+    if p ~= g_logged_port then
+      log("CEF port (from contract file): " .. p)
+      g_logged_port = p
+    end
+  elseif reason == "stale" then
+    -- The contract belongs to a Steam client that is gone: its port is either
+    -- dead or, worse, has since been handed to some unrelated process. Wait for
+    -- this session's client to publish instead of polling it (and fall back to
+    -- 8080 meanwhile, which is right for a vanilla Steam launch).
+    if not g_logged_stale then
+      g_logged_stale = true
+      log("CEF port contract is from a previous Steam session -> ignoring it (using " .. p .. ")")
+    end
   end
   return p
 end
@@ -821,6 +834,31 @@ function Conn:close()
   self.sock = nil
 end
 
+-- ── discovery cadence ──────────────────────────────────────────────────────
+-- Before the first successful attach, a failed /json is the NORMAL state: Steam
+-- has not opened its CEF endpoint yet (or the contract still names the previous
+-- session's port). Backing off on those expected failures used to blind the
+-- sidecar for up to 8 s at a time (measured: 1 -> 2 -> 4 -> 8 s while Steam was
+-- already painting), so pre-attach discovery runs at a fixed cadence instead.
+-- The doubling backoff is kept for POST-injection reconnects, where repeated
+-- failures really do mean "nothing to talk to".
+injector.DISCOVER_INTERVAL = 0.3
+injector.RECONNECT_BACKOFF_MAX = 15
+
+-- next_retry_delay(attached_once, backoff) -> seconds to wait after a failed or
+-- not-yet-ready probe. Pure.
+function injector.next_retry_delay(attached_once, backoff)
+  if not attached_once then return injector.DISCOVER_INTERVAL end
+  return math.max(injector.DISCOVER_INTERVAL, tonumber(backoff) or 1)
+end
+
+-- grow_backoff(attached_once, backoff) -> the backoff to use for the NEXT
+-- failure. Pure; stays at 1 until the first attach has happened.
+function injector.grow_backoff(attached_once, backoff)
+  if not attached_once then return 1 end
+  return math.min((tonumber(backoff) or 1) * 2, injector.RECONNECT_BACKOFF_MAX)
+end
+
 -- ── Multi-target manager (cooperative new/fds/tick) ────────────────────────
 local State = {}
 State.__index = State
@@ -847,6 +885,8 @@ function injector.new(opts)
     backoff = 1,
     next_attempt = 0,
     ui_ready = false,    -- latched once Steam's main UI is up (post-login/paint)
+    attached_once = false, -- has any target ever been attached? (gates backoff)
+    last_port = nil,     -- CEF port the current backoff was armed against
     shared_ws_url = nil,
     gamepad_ui = false,  -- refreshed from Steam's current CEF target markers
   }, State)
@@ -900,14 +940,40 @@ function State:needs_fast_tick()
   return false
 end
 
+-- How long the loop may block before calling tick() again. A pending browser
+-- request needs the fast cadence; before the first attach we want the discovery
+-- cadence (otherwise a one-second sleep, not the discovery interval, is what
+-- decides how quickly the moon button appears); afterwards the idle second is
+-- enough because attached sockets wake select() themselves.
+function State:poll_timeout()
+  if self:needs_fast_tick() then return 0.01 end
+  if not self.attached_once then return injector.DISCOVER_INTERVAL end
+  return 1
+end
+
 -- Discover wanted targets and connect to any not yet connected (backoff-gated).
 function State:_discover()
-  local now = os.time()
+  -- Sub-second clock: os.time() has one-second granularity, which cannot express
+  -- the pre-attach discovery cadence.
+  local now = socket.gettime()
+  -- Read the contract every tick (it is a few bytes) so this session's port is
+  -- picked up the moment the client publishes it. A backoff armed against the
+  -- OLD endpoint must not delay the first attempt against the new one.
+  local port = cef_port()
+  if port ~= self.last_port then
+    if self.last_port ~= nil then
+      log("CEF port changed " .. tostring(self.last_port) .. " -> " .. tostring(port)
+        .. " -> retrying discovery immediately")
+    end
+    self.last_port = port
+    self.backoff = 1
+    self.next_attempt = 0
+  end
   if now < self.next_attempt then return end
   local targets, err = list_all_targets()
   if not targets then
-    self.next_attempt = now + self.backoff
-    self.backoff = math.min(self.backoff * 2, 15)
+    self.next_attempt = now + injector.next_retry_delay(self.attached_once, self.backoff)
+    self.backoff = injector.grow_backoff(self.attached_once, self.backoff)
     return
   end
   self.backoff = 1
@@ -924,7 +990,9 @@ function State:_discover()
       self.ui_ready = true
       log("Steam UI ready -> attaching")
     else
-      self.next_attempt = now + 2   -- poll readiness every 2s, no backoff
+      -- Readiness is polled, never backed off: the gate itself is unchanged (it
+      -- is what prevents the black-screen boot), only how often we look.
+      self.next_attempt = now + injector.DISCOVER_INTERVAL
       return
     end
   end
@@ -935,7 +1003,12 @@ function State:_discover()
     local t = r.target
     if not self.conns[t.webSocketDebuggerUrl] then
       local conn = conn_new(t, r.assets, self.registry, self, r.recovery)
-      if conn:connect() then self.conns[t.webSocketDebuggerUrl] = conn end
+      if conn:connect() then
+        self.conns[t.webSocketDebuggerUrl] = conn
+        -- First attach reached: from here on, repeated failures are genuine
+        -- reconnect failures and may back off.
+        self.attached_once = true
+      end
     end
   end
 end
