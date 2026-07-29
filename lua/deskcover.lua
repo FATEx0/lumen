@@ -26,6 +26,31 @@ function Tick:should_repatch(now, st)
   return changed
 end
 
+-- Once-per-session deferred pass. The initial coverage heal must not compete
+-- with Steam's own startup (it is 2.9-3.9 s of shell CPU), and nothing depends
+-- on it happening early: the wrapper kicks the guardian at launch and the
+-- guardian units watch the sources. new_initial{ delay = <secs> } fires exactly
+-- once, `delay` seconds after the first due() call. Pure (caller supplies now).
+local Initial = {}
+Initial.__index = Initial
+
+function deskcover.new_initial(opts)
+  opts = opts or {}
+  return setmetatable(
+    { delay = opts.delay or 45, due_at = nil, done = false }, Initial)
+end
+
+function Initial:due(now)
+  if self.done then return false end
+  if self.due_at == nil then
+    self.due_at = now + self.delay
+    return false
+  end
+  if now < self.due_at then return false end
+  self.done = true
+  return true
+end
+
 local lfs_ok, lfs = pcall(require, "lfs")
 
 local function home() return os.getenv("HOME") or "" end

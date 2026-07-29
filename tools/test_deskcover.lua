@@ -25,6 +25,18 @@ ok(w:should_repatch(9, { exists = false, mtime = 0, patched = false }) == false,
 ok(w:should_repatch(10, { exists = true, mtime = 400, patched = false }) == false,
    "within interval -> rate-limited skip")
 
+-- Deferred once-per-session pass: never fires at boot, fires exactly once after
+-- the delay, and never again (the guardian units + the autostart watch cover the
+-- rest of the session).
+local i = deskcover.new_initial({ delay = 45 })
+ok(i:due(1000) == false, "initial pass does not fire on the first tick")
+ok(i:due(1030) == false, "initial pass does not fire before the delay")
+ok(i:due(1044) == false, "initial pass does not fire one second early")
+ok(i:due(1045) == true, "initial pass fires once the delay has passed")
+ok(i:due(1046) == false, "initial pass never fires twice")
+ok(i:due(9999) == false, "initial pass stays done")
+ok(deskcover.new_initial().delay == 45, "default deferral is 45s")
+
 -- path helpers derive from $HOME
 local home = os.getenv("HOME") or ""
 ok(deskcover.autostart_path() == home .. "/.config/autostart/steam.desktop",

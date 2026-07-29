@@ -274,10 +274,13 @@ local function build_webview_assets()
 end
 
 local loop = require("loop")
--- One initial desktop-coverage pass per injected session (user-owned entries):
--- heals anything Steam/the DE reverted since the last session, before the tick
--- loop takes over the autostart watch. Best-effort.
-pcall(function() require("deskcover").run("--user") end)
+-- NOTE: the once-per-session desktop-coverage heal is NOT run here any more.
+-- Starting it at Lumen boot put a 2.9-3.9 s shell pass into the most
+-- CPU-contended second of Steam's launch — a second one, since the wrapper
+-- already kicks the guardian for the same work — and measurably delayed Steam
+-- becoming usable on a 4-core box. loop.run() now runs it once, ~45 s after
+-- boot (deskcover.new_initial), and the guardian .path/.timer units plus the
+-- loop's autostart watch keep covering drift in the meantime.
 -- Injection channels:
 --   * web views (store/community)  -> luatools.js + lumen_menu.js
 --   * the main client window ("Steam")  -> lumen_menu.js (carries the menubar

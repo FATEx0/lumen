@@ -35,9 +35,19 @@ function loop.run(opts)
   -- changes (the user toggling "run on startup" mid-session). Cheap: one stat of
   -- the autostart path per tick; see deskcover.
   local dc_tick = deskcover.new_tick({ interval = CHECK_EVERY })
+  -- The once-per-session coverage heal used to run at Lumen boot — i.e. in the
+  -- most CPU-contended second of Steam's launch, concurrently with the wrapper's
+  -- own guardian kick (measured: 2.9-3.9 s of shell CPU per pass on a 4-vCPU
+  -- box). Nothing needs it that early: the wrapper already kicks the guardian at
+  -- launch, the guardian .path/.timer units watch the sources, and the autostart
+  -- watch below catches mid-session drift. So it now runs once, well after boot.
+  local dc_initial = deskcover.new_initial({ delay = 45 })
   while true do
     local fds = inj:fds()
-    local wait_timeout = inj:needs_fast_tick() and 0.01 or 1
+    -- Pre-attach this is the discovery cadence, not a flat second: sleeping a
+    -- whole second between /json probes would itself decide how late the moon
+    -- button appears (see injector.DISCOVER_INTERVAL).
+    local wait_timeout = inj:poll_timeout()
     if #fds > 0 then
       socket.select(fds, nil, wait_timeout)
     else
@@ -46,6 +56,10 @@ function loop.run(opts)
     local now = os.time()
     if now >= next_check then
       next_check = now + CHECK_EVERY
+      if dc_initial:due(now) then
+        log("deferred once-per-session desktop-coverage pass")
+        deskcover.run("--user")
+      end
       if dc_tick:should_repatch(now, deskcover.stat_autostart()) then
         log("autostart entry changed/vanilla -> re-asserting desktop coverage")
         deskcover.run("--user")
