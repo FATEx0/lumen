@@ -67,6 +67,144 @@ do
   check(not dlc[250902], "lua: keyed depot not in dlc_appids")
 end
 
+-- ── 2b. imported Lua merge + creator output ────────────────────────────────
+do
+  local existing = table.concat({
+    "addappid(700)",
+    "addappid(702)",
+    'addappid(701,1,"' .. string.rep("a", 64) .. '")',
+  }, "\n")
+  local incoming = table.concat({
+    "addappid(700)",
+    "addappid(703)",
+    'setManifestid(701,"9001")',
+  }, "\n")
+  local merged, merr = mp.merge_lua_text(700, existing, incoming)
+  check(merged ~= nil and merr == nil, "merge lua: valid sources merge")
+  local parsed = mp.parse_lua(merged or "")
+  check(parsed.depots[701] and parsed.depots[701].key == string.rep("a", 64),
+    "merge lua: source key survives")
+  eq(parsed.depots[701].manifestid, "9001", "merge lua: imported pin survives")
+  local dlc = {}; for _, id in ipairs(parsed.dlc_appids) do dlc[id] = true end
+  check(dlc[702] and dlc[703], "merge lua: DLC declarations are unioned")
+
+  local draft, derr = mp.build_draft_lua({
+    appid = 700, dlc_appids = { 703, 702, 703 },
+    pins = { { depot = 701, gid = "9001" }, { depot = 704, gid = "" } },
+  })
+  check(draft ~= nil and derr == nil, "draft: valid request emits Lua")
+  local dp = mp.parse_lua(draft or "")
+  eq(dp.base, 700, "draft: base app declared")
+  eq(dp.depots[701].manifestid, "9001", "draft: non-empty manifest is pinned")
+  check(dp.depots[704] == nil, "draft: empty manifest means latest, no pin emitted")
+  local ordered = (draft or ""):find("addappid%(702%)") < (draft or ""):find("addappid%(703%)")
+  check(ordered, "draft: DLC appids are deduplicated and sorted")
+  local bad = mp.build_draft_lua({ appid = 700, pins = { { depot = "../1", gid = "2" } } })
+  check(bad == nil, "draft: malformed depot is rejected")
+
+  local inert_key = string.rep("f", 64)
+  local strict, strict_err = mp.merge_lua_text(700, table.concat({
+    "addappid(700)",
+    '-- addappid(701,1,"' .. inert_key .. '")',
+    'print("addappid(702)")',
+    '-- setManifestid(701,"9002")',
+  }, "\n"))
+  check(strict ~= nil and strict_err == nil
+    and not strict:find("701", 1, true) and not strict:find("702", 1, true)
+    and not strict:find("9002", 1, true),
+    "merge lua: comments and string contents remain inert")
+  local comments_only = mp.merge_lua_text(700, '-- addappid(700)\nprint("addappid(700)")\n')
+  check(comments_only == nil, "merge lua: commented or embedded base declaration is rejected")
+
+  local long_blocks = mp.merge_lua_text(700, table.concat({
+    "--[[",
+    "addappid(700)",
+    'addappid(701,1,"' .. inert_key .. '")',
+    "]]",
+    "[=[",
+    "addappid(702)",
+    'setManifestid(701,"9003")',
+    "]=]",
+  }, "\n"))
+  check(long_blocks == nil,
+    "merge lua: declarations inside multiline comments and strings remain inert")
+
+  local code_after_blocks = mp.merge_lua_text(700, table.concat({
+    "--[=[ ignored",
+    "addappid(999)",
+    "]=] addappid(700)",
+    "[==[addappid(998)]==] addappid(703)",
+  }, "\n"))
+  check(code_after_blocks ~= nil
+    and code_after_blocks:find("addappid(700)", 1, true)
+    and code_after_blocks:find("addappid(703)", 1, true)
+    and not code_after_blocks:find("999", 1, true)
+    and not code_after_blocks:find("998", 1, true),
+    "merge lua: parsing resumes after long-block terminators")
+
+  local overflow_draft = mp.build_draft_lua({
+    appid = 700, pins = { { depot = 701, gid = "18446744073709551616" } },
+  })
+  check(overflow_draft == nil, "draft: manifest gid above uint64 is rejected")
+end
+
+-- ── 2c. strict binary manifest metadata ────────────────────────────────────
+do
+  local function section(magic, body)
+    return string.pack("<I4I4", magic, #body) .. body
+  end
+  local depot, gid, created = 311211, "18446744073709551610", 1700000000
+  local function decimal_varint(text)
+    local digits = {}; for c in text:gmatch(".") do digits[#digits + 1] = tonumber(c) end
+    local out = {}
+    repeat
+      local next_digits, rem, started = {}, 0, false
+      for _, digit in ipairs(digits) do
+        local value = rem * 10 + digit
+        local q = math.floor(value / 128); rem = value % 128
+        if q ~= 0 or started then next_digits[#next_digits + 1] = q; started = true end
+      end
+      digits = next_digits
+      out[#out + 1] = rem
+    until #digits == 0
+    for i = 1, #out - 1 do out[i] = out[i] | 0x80 end
+    return string.char(table.unpack(out))
+  end
+  local metadata = "\x08" .. varint(depot)
+    .. "\x10" .. decimal_varint(gid) .. "\x18" .. varint(created)
+  local bytes = section(0x71F617D0, "payload")
+    .. section(0x1F4812BE, metadata) .. string.pack("<I4", 0x32C415AB)
+  local meta, err = mp.parse_manifest(bytes)
+  check(meta ~= nil and err == nil, "manifest: valid Steam sections accepted")
+  eq(meta.depot, depot, "manifest: depot comes from metadata")
+  eq(meta.gid, gid, "manifest: uint64 gid stays exact decimal text")
+  eq(meta.creation_time, created, "manifest: creation time parsed")
+  local no_terminal = section(0x71F617D0, "payload") .. section(0x1F4812BE, metadata)
+  check(mp.parse_manifest(no_terminal) ~= nil,
+    "manifest: valid stream without optional terminal marker accepted")
+  local mismatch = mp.parse_manifest(bytes, depot + 1, gid)
+  check(mismatch == nil, "manifest: expected depot mismatch rejected")
+  local named = mp.inspect_import_entries({ { name = "wrong-name.manifest", data = bytes } })
+  check(named and named.manifests[1].name == depot .. "_" .. gid .. ".manifest",
+    "import inspect: canonical manifest name is content-derived")
+
+  local overflow_gid = "18446744073709551616"
+  local overflow_metadata = "\x08" .. varint(depot)
+    .. "\x10" .. decimal_varint(overflow_gid) .. "\x18" .. varint(created)
+  local overflow_bytes = section(0x71F617D0, "payload")
+    .. section(0x1F4812BE, overflow_metadata) .. string.pack("<I4", 0x32C415AB)
+  check(mp.parse_manifest(overflow_bytes) == nil,
+    "manifest: gid above uint64 is rejected")
+
+  local conflicting = mp.inspect_import_entries({
+    { name = "first.manifest", data = bytes },
+    { name = "second.manifest", data = section(0x71F617D0, "different payload")
+      .. section(0x1F4812BE, metadata) .. string.pack("<I4", 0x32C415AB) },
+  })
+  check(conflicting == nil,
+    "import inspect: conflicting bytes for one depot and gid are rejected")
+end
+
 -- ── 3. config pins parse ───────────────────────────────────────────────────
 do
   local text = table.concat({
@@ -778,7 +916,160 @@ do
   os.execute("rm -rf '" .. root .. "'")
 end
 
--- ── 18. remove_additional_app (pure inverse of add_additional_app) ─────────
+-- ── 18. transactional mixed-file / ZIP importer ───────────────────────────
+do
+  local function mkdir(path) assert(os.execute("mkdir -p '" .. path .. "'") == true) end
+  local function read(path)
+    local f = io.open(path, "rb"); if not f then return nil end
+    local data = f:read("*a"); f:close(); return data
+  end
+  local function section(magic, body) return string.pack("<I4I4", magic, #body) .. body end
+  local function manifest(depot, gid, created)
+    local metadata = "\x08" .. varint(depot) .. "\x10" .. varint(tonumber(gid))
+      .. "\x18" .. varint(created)
+    return section(0x71F617D0, "payload") .. section(0x1F4812BE, metadata)
+      .. string.pack("<I4", 0x32C415AB)
+  end
+  local root = os.tmpname(); os.remove(root); mkdir(root)
+  local ctx = {
+    config_path = root .. "/config.yaml", stplug_dir = root .. "/stplug-in",
+    manifests_dir = root .. "/manifests", cache_dir = root .. "/cache",
+    imports_path = root .. "/imports.txt", steam_root = root,
+    import_root = root .. "/uploads",
+  }
+  mkdir(ctx.stplug_dir); mkdir(ctx.manifests_dir); mkdir(ctx.cache_dir)
+  local cfg = assert(io.open(ctx.config_path, "wb")); cfg:write("AdditionalApps:\nLogLevel: 2\n"); cfg:close()
+  local current = assert(io.open(ctx.stplug_dir .. "/700.lua", "wb"))
+  current:write('addappid(700)\naddappid(701,1,"' .. string.rep("a", 64) .. '")\n')
+  current:close()
+
+  local lua_data = 'addappid(700)\naddappid(702)\nsetManifestid(701,"9001")\n'
+  local man_data = manifest(701, "9001", 1700000000)
+  local begin = json.decode(mp.begin_game_import_rpc(ctx, json.encode({ files = {
+    { name = "game.lua", size = #lua_data },
+    { name = "renamed.manifest", size = #man_data },
+  } })))
+  check(begin.success and type(begin.session) == "string", "tx: begin allocates session")
+  local session = begin.session
+  local function mode(path)
+    local p = io.popen("stat -c %a '" .. path .. "' 2>/dev/null")
+    local value = p and p:read("*l") or nil
+    if p then p:close() end
+    return value
+  end
+  eq(mode(ctx.import_root .. "/" .. session), "700", "tx: session directory is private")
+  local b64 = require("b64")
+  local first = lua_data:sub(1, 17); local second = lua_data:sub(18)
+  local u1 = json.decode(mp.upload_game_import_chunk_rpc(ctx, json.encode({
+    session = session, file = 1, chunk = 0, data = b64.encode(first), final = false,
+  })))
+  check(u1.success, "tx: first ordered chunk accepted")
+  eq(mode(ctx.import_root .. "/" .. session .. "/file_1"), "600",
+    "tx: uploaded Lua is private")
+  local wrong = json.decode(mp.upload_game_import_chunk_rpc(ctx, json.encode({
+    session = session, file = 1, chunk = 2, data = b64.encode(second), final = true,
+  })))
+  check(not wrong.success, "tx: out-of-order chunk rejected")
+  local premature = json.decode(mp.upload_game_import_chunk_rpc(ctx, json.encode({
+    session = session, file = 1, chunk = 1,
+    data = b64.encode(second:sub(1, 1)), final = true,
+  })))
+  check(not premature.success,
+    "tx: premature final chunk is rejected without poisoning session")
+  local u2 = json.decode(mp.upload_game_import_chunk_rpc(ctx, json.encode({
+    session = session, file = 1, chunk = 1, data = b64.encode(second), final = true,
+  })))
+  local u3 = json.decode(mp.upload_game_import_chunk_rpc(ctx, json.encode({
+    session = session, file = 2, chunk = 0, data = b64.encode(man_data), final = true,
+  })))
+  check(u2.success and u3.success, "tx: remaining chunks accepted")
+
+  local prep = json.decode(mp.prepare_game_import_rpc(ctx, json.encode({ session = session })))
+  check(prep.success and #prep.apps == 1 and #prep.manifests == 1,
+    "tx: prepare inspects mixed Lua and manifest")
+  eq(prep.apps[1].appid, 700, "tx: prepared appid")
+  eq(prep.manifests[1].depot, 701, "tx: manifest metadata drives depot")
+  check(read(ctx.manifests_dir .. "/701_9001.manifest") == nil,
+    "tx: prepare publishes nothing")
+
+  local committed = json.decode(mp.commit_game_import_rpc(ctx, json.encode({ session = session })))
+  check(committed.success and committed.apps == 1 and committed.manifests == 1,
+    "tx: commit publishes complete batch")
+  check(read(ctx.manifests_dir .. "/701_9001.manifest") == man_data,
+    "tx: manifest archived under canonical name")
+  local installed_lua = read(ctx.stplug_dir .. "/700.lua") or ""
+  check(installed_lua:find(string.rep("a", 64), 1, true) ~= nil,
+    "tx: existing source key is preserved")
+  check(installed_lua:find('setManifestid(701,"9001")', 1, true) ~= nil,
+    "tx: imported pin is merged")
+  local pins = mp.parse_pins(read(ctx.config_path) or "")
+  eq(pins[700].depots[701], "9001", "tx: matching manifest pin persisted")
+
+  -- A second, keys-incomplete Lua is enriched inside its private upload
+  -- session. Prepare remains read-only and Commit publishes the source key
+  -- under the uploaded manifest choice.
+  local incomplete = 'addappid(750)\nsetManifestid(751,"7501")\n'
+  local eb = json.decode(mp.begin_game_import_rpc(ctx, json.encode({ files = {
+    { name = "750.lua", size = #incomplete },
+  } })))
+  local eu = json.decode(mp.upload_game_import_chunk_rpc(ctx, json.encode({
+    session = eb.session, file = 1, chunk = 0, data = b64.encode(incomplete), final = true,
+  })))
+  check(eu.success, "enrich: incomplete Lua upload accepted")
+  local source_lua = 'addappid(750)\naddappid(752)\naddappid(751,1,"'
+    .. string.rep("c", 64) .. '")\n'
+  local enriched = json.decode(mp.enrich_game_import_rpc(ctx, json.encode({
+    session = eb.session, appid = 750, lua = source_lua,
+  })))
+  check(enriched.success, "enrich: validated source Lua attached to private session")
+  local ep = json.decode(mp.prepare_game_import_rpc(ctx, json.encode({ session = eb.session })))
+  check(ep.success and ep.apps[1].keys == 1 and ep.apps[1].pins == 1,
+    "enrich: prepare sees source key and uploaded pin")
+  check(read(ctx.stplug_dir .. "/750.lua") == nil,
+    "enrich: source lookup publishes nothing before commit")
+  local ec = json.decode(mp.commit_game_import_rpc(ctx, json.encode({ session = eb.session })))
+  local enriched_lua = read(ctx.stplug_dir .. "/750.lua") or ""
+  check(ec.success and enriched_lua:find(string.rep("c", 64), 1, true) ~= nil,
+    "enrich: commit publishes missing source key")
+  check(enriched_lua:find('setManifestid(751,"7501")', 1, true) ~= nil,
+    "enrich: uploaded manifest choice wins")
+
+  -- The creator's blank GID means Latest even when the app was previously
+  -- locked. SyncGamePins must remove that old YAML entry, not merely omit a new
+  -- setManifestid line.
+  local latest = json.decode(mp.sync_game_pins_rpc(ctx, json.encode({
+    appid = 750, lua = 'addappid(750)\naddappid(751,1,"' .. string.rep("c", 64) .. '")\n',
+  })))
+  local latest_pins = mp.parse_pins(read(ctx.config_path) or "")
+  check(latest.success and latest.pinned == 0 and latest_pins[750] == nil,
+    "creator: blank manifests clear an older pin and restore Latest")
+
+  local zip_src = root .. "/zip-src"; mkdir(zip_src .. "/nested")
+  local zlua = assert(io.open(zip_src .. "/nested/800.lua", "wb"))
+  zlua:write('addappid(800)\naddappid(801,1,"' .. string.rep("b", 64) .. '")\n'); zlua:close()
+  local zman_data = manifest(801, "8001", 1800000000)
+  local zman = assert(io.open(zip_src .. "/nested/anything.manifest", "wb")); zman:write(zman_data); zman:close()
+  assert(os.execute("cd '" .. zip_src .. "' && zip -qr '" .. root .. "/bundle.zip' nested") == true)
+  local zip_data = assert(read(root .. "/bundle.zip"))
+  local zb = json.decode(mp.begin_game_import_rpc(ctx, json.encode({ files = {
+    { name = "bundle.zip", size = #zip_data },
+  } })))
+  local zu = json.decode(mp.upload_game_import_chunk_rpc(ctx, json.encode({
+    session = zb.session, file = 1, chunk = 0, data = b64.encode(zip_data), final = true,
+  })))
+  check(zu.success, "zip: archive upload accepted")
+  local zp = json.decode(mp.prepare_game_import_rpc(ctx, json.encode({ session = zb.session })))
+  check(zp.success and #zp.apps == 1 and #zp.manifests == 1,
+    "zip: nested Lua and manifest are safely discovered")
+  local zc = json.decode(mp.commit_game_import_rpc(ctx, json.encode({ session = zb.session })))
+  check(zc.success and read(ctx.stplug_dir .. "/800.lua") ~= nil
+    and read(ctx.manifests_dir .. "/801_8001.manifest") == zman_data,
+    "zip: inspected package commits")
+
+  os.execute("rm -rf '" .. root .. "'")
+end
+
+-- ── 19. remove_additional_app (pure inverse of add_additional_app) ─────────
 do
   local base = "AdditionalApps:\n  - 555\n  - 700\nLogLevel: 2\n"
   local out, st = mp.remove_additional_app(base, 555)
@@ -804,7 +1095,7 @@ do
   check(zout:find("LogLevel: 2") ~= nil, "remove_app(zero-indent): other keys kept")
 end
 
--- ── 19. DeleteBuild / DeleteAll / clear keeps LuaTools build ───────────────
+-- ── 20. DeleteBuild / DeleteAll / clear keeps LuaTools build ───────────────
 do
   local function mkdir(p) os.execute("mkdir -p '" .. p .. "'") end
   local function exists(p) local h = io.open(p, "rb"); if h then h:close(); return true end return false end

@@ -321,209 +321,781 @@
   // Re-fetch + re-render the whole Game Updates list into `body`.
   function reloadGameUpdates(body) { renderGameUpdates(body); }
 
-  // Read an uploaded lua.tools .lua and import the game it describes, WITHOUT
-  // requiring it to have been added via LuaTools first. To make a game's DLCs
-  // installable we need their per-depot decryption keys; a "Manifest"-style .lua
-  // is often base-only (just the base depot key). Per-depot keys are build-
-  // independent, so we prefer the plugin's SOURCES (which ship the complete .lua
-  // with every depot key) and then re-apply the uploaded .lua's pin on top:
-  //   InspectLua (appid + installed?) ->
-  //     installed  -> reinstall-confirm modal -> runImport
-  //     not added  -> runImport
-  //   runImport: CheckApisForApp -> StartAddViaLuaToolsSmart (races sources,
-  //     picks the most COMPLETE -> every depot key) -> ImportLuaPin (apply the
-  //     uploaded .lua's pin); fall back to ImportLuaFull (the uploaded, possibly
-  //     base-only .lua) when no source has the app.
-  function importLuaFromFile(file, body) {
-    var GU = guStrings();
-    var reader = new FileReader();
-    reader.onload = function () {
-      var text = String(reader.result);
-      call("InspectLua", { json: JSON.stringify({ lua: text }) })
-        .then(function (res) {
-          var r = JSON.parse(res);
-          if (!r || !r.success) {
-            var e2 = (r && r.error) || "";
-            var msg = /determine app id|app id from/.test(e2) ? GU.importNoApp
-                    : /is for app/.test(e2) ? GU.importBadApp
-                    : GU.importFail + e2;
-            throw new Error(msg);
-          }
-          if (r.alreadyOnBuild) {
-            // Already installed at exactly this build: nothing to change. Offer a
-            // force "apply anyway" (re-fetch + re-verify) but never auto-validate.
-            showConfirm({
-              title: GU.alreadyTitle, body: GU.alreadyBody,
-              confirmText: GU.alreadyApply, declineText: GU.alreadyCancel,
-              onConfirm: function () { runImport(r, text, body); },
-            });
-          } else if (r.installed) {
-            showConfirm({
-              title: GU.reinstallTitle, body: GU.reinstallBody,
-              confirmText: GU.reinstallConfirm, declineText: GU.reinstallCancel,
-              onConfirm: function () { runImport(r, text, body); },
-            });
-          } else {
-            runImport(r, text, body);
-          }
-        })
-        .catch(function (e) { log("InspectLua", e); alert((e && e.message) || GU.importFail); });
-    };
-    reader.onerror = function () { alert(guStrings().importFail); };
-    reader.readAsText(file);
+  // ── Source drafts + robust file import ──────────────────────────────────
+  function parseRpc(raw) {
+    var value = typeof raw === "string" ? JSON.parse(raw) : raw;
+    if (!value || value.success === false) throw new Error((value && value.error) || "Request failed");
+    return value;
   }
 
-  // Poll the plugin's add status until terminal. Resolves "done" | "failed".
-  // The source package (a .lua + manifests) is small, so this settles quickly;
-  // a cap keeps a stuck backend from polling forever.
-  function pollAddStatus(appid, prog) {
-    var GU = guStrings();
-    return new Promise(function (resolve) {
+  function cancelGameDraft(appid, session) {
+    if (!appid || !session) return Promise.resolve();
+    return call("CancelGameDraft", { appid: appid, session: session }).catch(function () {});
+  }
+
+  function pollGameDraft(appid, session, onState) {
+    return new Promise(function (resolve, reject) {
       var ticks = 0;
       var tick = function () {
-        if (++ticks > 300) { resolve("failed"); return; }
-        call("GetAddViaLuaToolsStatus", { appid: appid })
-          .then(function (res) {
-            var p = JSON.parse(res);
-            var st = (p && p.state) || {};
-            var s = st.status;
-            if (s === "done") { resolve(st.success ? "done" : "failed"); return; }
-            if (s === "failed" || s === "cancelled") { resolve("failed"); return; }
-            if (prog) prog.update(
-              s === "downloading" ? GU.loadDownloading
-              : s === "processing" || s === "installing" ? GU.loadProcessing
-              : GU.loadChecking);
-            setTimeout(tick, 600);
+        if (++ticks > 600) { reject(new Error(guStrings().sourceTimeout)); return; }
+        call("GetGameDraftStatus", { appid: appid, session: session })
+          .then(parseRpc)
+          .then(function (result) {
+            var state = result.state || {};
+            if (onState) onState(state);
+            if (state.status === "ready") { resolve(state.draft); return; }
+            if (state.status === "failed" || state.status === "cancelled") {
+              var sourceError = new Error(state.error || guStrings().sourceFail);
+              sourceError.code = state.errorCode;
+              reject(sourceError); return;
+            }
+            setTimeout(tick, 500);
           })
-          .catch(function () { resolve("failed"); });
+          .catch(reject);
       };
       tick();
     });
   }
 
-  // Add the game from the plugin's sources (complete depot keys). Resolves true
-  // if a source supplied the game, false to fall back to the uploaded .lua.
-  // Uses the SMART add (StartAddViaLuaToolsSmart): it races every enabled source
-  // and picks the most COMPLETE package, so a game whose first-available source
-  // is missing DLC keys still gets them from a fuller one.
-  function addFromSources(appid, prog) {
-    var GU = guStrings();
-    // No LuaTools plugin (--noplugin install): there are no plugin sources to
-    // query, so skip straight to the native .lua import (ImportLuaFull). This
-    // avoids calling the plugin-only CheckApisForApp/StartAddViaLuaToolsSmart
-    // RPCs that aren't registered in this mode.
-    if (window.__lumenNoPlugin) return Promise.resolve(false);
-    return call("CheckApisForApp", { appid: appid })
-      .then(function (res) {
-        var p = JSON.parse(res);
-        var results = (p && p.results) || [];
-        var available = results.some(function (r) { return r && r.available; });
-        if (!available) return false;
-        if (prog) prog.update(GU.loadDownloading);
-        return call("StartAddViaLuaToolsSmart", { appid: appid })
-          .then(function () { return pollAddStatus(appid, prog); })
-          .then(function (outcome) { return outcome === "done"; });
-      })
-      .catch(function () { return false; });
-  }
-
-  // Add the game (preferring sources for complete keys) then apply the uploaded
-  // .lua's pin. `info` is the InspectLua result.
-  function runImport(info, text, body) {
-    var GU = guStrings();
-    var appid = info.appid;
-    var hasPins = (info.pinned || 0) > 0;
-    var prog = showProgress(GU.importLua);
-    prog.update(GU.loadChecking);
-    addFromSources(appid, prog)
-      .then(function (fromSource) {
-        prog.close();
-        // A from-source add (StartAddViaLuaToolsSmart) doesn't go through
-        // ImportLuaFull, so mark it here as added via "Load .lua" (the no-source
-        // path is auto-marked by ImportLuaFull). Sequence the reload after the
-        // mark persists so the build badge picks up "from .lua" on first render.
-        if (fromSource) {
-          call("MarkLuaImport", { appid: appid })
-            .catch(function (e) { log("MarkLuaImport", e); })
-            .then(function () { reloadGameUpdates(body); });
-        } else {
-          reloadGameUpdates(body);
-        }
-        // applyPin writes the .lua's build pin (and, on the no-source fallback,
-        // also adds the game). Same gating as a manual pin: it runs ONLY if the
-        // user follows through the uninstall/restart the pin needs to take
-        // effect. Declining leaves no half-applied build pin — a game added from
-        // a source stays (it'll install at the latest build), nothing loops.
-        var applyPin = function () {
-          var p;
-          if (fromSource) {
-            p = hasPins
-              ? call("ImportLuaPin", { json: JSON.stringify({ appid: appid, lua: text }) })
-              : Promise.resolve('{"success":true}');
-          } else {
-            // No source had the app: ImportLuaFull writes the uploaded .lua
-            // directly (adds the game + its pins). Gated, so declining adds nothing.
-            p = call("ImportLuaFull", { json: JSON.stringify({ lua: text }) });
-          }
-          return p.then(function (ir) {
-            if (typeof ir === "string") {
-              var r2 = JSON.parse(ir);
-              if (!r2 || !r2.success) throw new Error((r2 && r2.error) || GU.importFail);
-            }
-            reloadGameUpdates(body);
+  function startSourceDraft(appid, onState) {
+    if (window.__lumenNoPlugin) return Promise.reject(new Error(guStrings().sourcesUnavailable));
+    return call("StartGameDraft", { appid: appid })
+      .then(parseRpc)
+      .then(function (start) {
+        return pollGameDraft(appid, start.session, onState)
+          .then(function (draft) {
+            return { appid: appid, session: start.session, draft: draft };
+          })
+          .catch(function (error) {
+            return cancelGameDraft(appid, start.session).then(function () { throw error; });
           });
-        };
-        if (info.installed) {
-          // Installed at a different build: a verify won't switch it, so the pin
-          // is applied and the game uninstalled (then reinstalled fresh at the
-          // pin) only if the user proceeds.
-          showUninstallPrompt(appid, applyPin);
-        } else {
-          showConfirm({
-            title: GU.restartTitle,
-            body: fromSource ? GU.restartBody : GU.restartBodyPartial,
-            confirmText: GU.restartNow,
-            declineText: GU.restartLater,
-            onConfirm: function () {
-              Promise.resolve(applyPin())
-                .then(function () {
-                  call("RestartSteam", {}).catch(function (e) { log("RestartSteam", e); });
-                })
-                .catch(function (e) { log("ImportLuaPin", e); alert((e && e.message) || GU.importFail); });
-            },
-          });
-        }
-      })
-      .catch(function (e) {
-        prog.close();
-        log("runImport", e);
-        alert((e && e.message) || GU.importFail);
       });
   }
 
-  // The single top-of-page "Load .lua" button (replaces the per-card import).
-  // Reads the file in-page (FileReader) and hands its text to importLuaFromFile;
-  // no native file dialog or filesystem path is ever needed.
-  function loadLuaButton(body) {
+  function formatSourceBytes(value) {
+    value = Math.max(0, Number(value) || 0);
+    if (value < 1024) return Math.floor(value) + " B";
+    if (value < 1024 * 1024) return (value / 1024).toFixed(value < 10240 ? 1 : 0) + " KB";
+    return (value / (1024 * 1024)).toFixed(value < 10 * 1024 * 1024 ? 1 : 0) + " MB";
+  }
+
+  function sourceProgressMessage(state) {
+    var GU = guStrings();
+    if (!state || state.status !== "downloading") return GU.loadProcessing;
+    var received = Number(state.bytesRead) || 0;
+    var total = Number(state.totalBytes) || 0;
+    if (total > 0) {
+      var percent = Math.min(99, Math.floor(received * 100 / total));
+      return GU.loadDownloading + " " + percent + "%  ·  "
+        + formatSourceBytes(received) + " / " + formatSourceBytes(total);
+    }
+    if (received > 0) return GU.loadDownloading + " " + formatSourceBytes(received);
+    return GU.loadDownloading;
+  }
+
+  function bytesToBase64(bytes) {
+    var binary = "";
+    for (var offset = 0; offset < bytes.length; offset += 0x8000) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(offset, offset + 0x8000));
+    }
+    return btoa(binary);
+  }
+
+  function uploadImportFile(session, file, fileIndex, progress) {
+    var chunkSize = 192 * 1024;
+    var offset = 0, chunk = 0;
+    var next = function () {
+      if (file.size === 0 && chunk === 0) {
+        return call("UploadGameImportChunk", { json: JSON.stringify({
+          session: session, file: fileIndex, chunk: 0, data: "", final: true,
+        }) }).then(parseRpc);
+      }
+      if (offset >= file.size) return Promise.resolve();
+      var end = Math.min(offset + chunkSize, file.size);
+      return file.slice(offset, end).arrayBuffer().then(function (buffer) {
+        return call("UploadGameImportChunk", { json: JSON.stringify({
+          session: session, file: fileIndex, chunk: chunk,
+          data: bytesToBase64(new Uint8Array(buffer)), final: end === file.size,
+        }) });
+      }).then(parseRpc).then(function () {
+        offset = end; chunk += 1;
+        if (progress) progress(file.name, offset, file.size);
+        return next();
+      });
+    };
+    return next();
+  }
+
+  function enrichImportApps(session, apps, status) {
+    if (window.__lumenNoPlugin || !apps.length) return Promise.resolve([]);
+    var warnings = [];
+    return apps.reduce(function (chain, app) {
+      return chain.then(function () {
+        status(guStrings().sourceForApp.replace("{appid}", app.appid));
+        return startSourceDraft(app.appid, function (state) {
+          status(sourceProgressMessage(state));
+        }).then(function (source) {
+          return call("EnrichGameImport", { json: JSON.stringify({
+            session: session, appid: app.appid, lua: source.draft.lua,
+          }) }).then(parseRpc).then(function () {
+            return call("CancelGameDraft", { appid: app.appid, session: source.session }).catch(function () {});
+          });
+        }).catch(function (error) {
+          warnings.push(guStrings().sourceSkipped.replace("{appid}", app.appid)
+            + " " + ((error && error.message) || error));
+        });
+      });
+    }, Promise.resolve()).then(function () { return warnings; });
+  }
+
+  function renderImportSummary(body, session, prepared, extraWarnings) {
+    var GU = guStrings();
+    body.textContent = "";
+    guShowClearBtn(false);
+    var back = document.createElement("div");
+    back.className = "lumen-back";
+    back.textContent = "\u2190 " + GU.back;
+    back.addEventListener("click", function () {
+      call("CancelGameImport", { json: JSON.stringify({ session: session }) }).catch(function () {});
+      renderGameUpdates(body);
+    });
+    body.appendChild(back);
+
+    var title = document.createElement("div");
+    title.className = "lumen-sub-title";
+    title.textContent = GU.importReview;
+    body.appendChild(title);
+    var intro = document.createElement("div");
+    intro.className = "lumen-note";
+    intro.textContent = GU.importReviewDesc;
+    body.appendChild(intro);
+
+    var summary = document.createElement("div");
+    summary.className = "lumen-import-summary";
+    var apps = Array.isArray(prepared.apps) ? prepared.apps : [];
+    var manifests = Array.isArray(prepared.manifests) ? prepared.manifests : [];
+    [
+      [GU.importGames, String(apps.length)],
+      [GU.importManifests, String(manifests.length)],
+      [GU.importKeys, String(apps.reduce(function (n, app) { return n + (app.keys || 0); }, 0))],
+    ].forEach(function (item) {
+      var stat = document.createElement("div");
+      stat.className = "lumen-import-stat";
+      stat.innerHTML = "<span></span><strong></strong>";
+      stat.firstChild.textContent = item[0];
+      stat.lastChild.textContent = item[1];
+      summary.appendChild(stat);
+    });
+    body.appendChild(summary);
+
+    if (apps.length) {
+      var appList = document.createElement("div");
+      appList.className = "lumen-import-list";
+      apps.forEach(function (app) {
+        var row = document.createElement("div");
+        row.className = "lumen-import-item";
+        var label = document.createElement("span");
+        label.textContent = "App " + app.appid;
+        fetchAppName(app.appid).then(function (name) { if (name) label.textContent = name + "  ·  " + app.appid; });
+        var detail = document.createElement("small");
+        detail.textContent = (app.keys || 0) + " " + GU.keysLabel + "  ·  "
+          + (app.pins || 0) + " " + GU.manifestsLabel
+          + (app.installed ? "  ·  " + GU.current : "");
+        row.appendChild(label); row.appendChild(detail); appList.appendChild(row);
+      });
+      body.appendChild(appList);
+    }
+
+    var warnings = (Array.isArray(prepared.warnings) ? prepared.warnings : []).concat(extraWarnings || []);
+    warnings.forEach(function (warning) { addLine(body, warning, "advanced", "!"); });
+    if (!apps.length && manifests.length) addLine(body, GU.manifestOnlyNote, "info", "i");
+
+    var error = document.createElement("div");
+    error.className = "lumen-err";
+    body.appendChild(error);
+    var actions = document.createElement("div");
+    actions.className = "lumen-builder-actions";
+    var cancel = document.createElement("button");
+    cancel.className = "lumen-mbtn";
+    cancel.textContent = GU.cancel;
+    cancel.addEventListener("click", function () { back.click(); });
+    var commit = document.createElement("button");
+    commit.className = "lumen-mbtn primary";
+    commit.textContent = GU.importConfirm;
+    commit.addEventListener("click", function () {
+      commit.disabled = true; error.textContent = ""; commit.textContent = GU.importing;
+      call("CommitGameImport", { json: JSON.stringify({ session: session }) })
+        .then(parseRpc)
+        .then(function () {
+          showConfirm({
+            title: GU.restartTitle, body: GU.importDone,
+            declineText: GU.restartLater, confirmText: GU.restartNow,
+            onConfirm: function () { call("RestartSteam", {}).catch(function (e) { log("RestartSteam", e); }); },
+          });
+          renderGameUpdates(body);
+        })
+        .catch(function (e) {
+          commit.disabled = false; commit.textContent = GU.importConfirm;
+          error.textContent = GU.importFail + ((e && e.message) || e);
+        });
+    });
+    actions.appendChild(cancel); actions.appendChild(commit); body.appendChild(actions);
+  }
+
+  function importSelectedFiles(files, body) {
+    var GU = guStrings();
+    files = Array.prototype.slice.call(files || []);
+    if (!files.length) return;
+    var prog = showProgress(GU.importFiles);
+    prog.update(GU.importPreparing);
+    var session;
+    call("BeginGameImport", { json: JSON.stringify({ files: files.map(function (file) {
+      return { name: file.name, size: file.size };
+    }) }) }).then(parseRpc).then(function (start) {
+      session = start.session;
+      return files.reduce(function (chain, file, index) {
+        return chain.then(function () {
+          return uploadImportFile(session, file, index + 1, function (name, received, total) {
+            var pct = total ? Math.floor(received * 100 / total) : 100;
+            prog.update(GU.importUploading.replace("{file}", name).replace("{percent}", pct));
+          });
+        });
+      }, Promise.resolve());
+    }).then(function () {
+      prog.update(GU.importInspecting);
+      return call("PrepareGameImport", { json: JSON.stringify({ session: session }) }).then(parseRpc);
+    }).then(function (first) {
+      return enrichImportApps(session, Array.isArray(first.apps) ? first.apps : [], function (message) {
+        prog.update(message);
+      }).then(function (warnings) {
+        return call("PrepareGameImport", { json: JSON.stringify({ session: session }) })
+          .then(parseRpc).then(function (finalPrep) { return { prepared: finalPrep, warnings: warnings }; });
+      });
+    }).then(function (result) {
+      prog.close();
+      renderImportSummary(body, session, result.prepared, result.warnings);
+    }).catch(function (e) {
+      prog.close();
+      if (session) call("CancelGameImport", { json: JSON.stringify({ session: session }) }).catch(function () {});
+      alert(GU.importFail + ((e && e.message) || e));
+    });
+  }
+
+  function gameUpdateActions(body) {
     var GU = guStrings();
     var wrap = document.createElement("div");
     wrap.className = "lumen-gu-actions";
+    var add = document.createElement("button");
+    add.className = "lumen-mbtn primary";
+    add.textContent = "+ " + GU.addGame;
+    add.addEventListener("click", function () { renderGameCreator(body); });
     var btn = document.createElement("button");
     btn.className = "lumen-mbtn primary lumen-load-lua";
-    btn.textContent = "\u2191 " + GU.importLua;
-    btn.title = GU.loadTopHint;
+    btn.textContent = "\u2191 " + GU.importFiles;
+    btn.title = GU.importFilesHint;
     var fileIn = document.createElement("input");
     fileIn.type = "file";
-    fileIn.accept = ".lua";
+    fileIn.multiple = true;
+    fileIn.accept = ".lua,.manifest,.zip";
     fileIn.style.display = "none";
     btn.addEventListener("click", function () { fileIn.value = ""; fileIn.click(); });
-    fileIn.addEventListener("change", function () {
-      var f = fileIn.files && fileIn.files[0];
-      if (f) importLuaFromFile(f, body);
-    });
-    wrap.appendChild(btn);
-    wrap.appendChild(fileIn);
+    fileIn.addEventListener("change", function () { importSelectedFiles(fileIn.files, body); });
+    wrap.appendChild(add); wrap.appendChild(btn); wrap.appendChild(fileIn);
     return wrap;
+  }
+
+  var APP_DETAILS_TTL = 7 * 24 * 60 * 60 * 1000;
+  function fetchAppDetails(appid) {
+    var key = "lumen-game-details-v1:" + appid;
+    try {
+      var cached = JSON.parse(localStorage.getItem(key) || "null");
+      if (cached && cached.savedAt && Date.now() - cached.savedAt < APP_DETAILS_TTL) {
+        return Promise.resolve(cached.value);
+      }
+    } catch (e) {}
+    var fallback = {
+      name: "App " + appid, image: capsuleUrl(appid), dlc: [],
+    };
+    var request;
+    try {
+      request = fetch("https://store.steampowered.com/api/appdetails?appids=" + appid)
+        .then(function (response) { return response.json(); })
+        .then(function (json) {
+          var data = json && json[appid] && json[appid].success && json[appid].data;
+          if (!data) return fallback;
+          var value = {
+            name: data.name || fallback.name,
+            image: data.header_image || data.capsule_image || fallback.image,
+            dlc: Array.isArray(data.dlc) ? data.dlc.filter(function (id) { return /^\d+$/.test(String(id)); }) : [],
+          };
+          try { localStorage.setItem(key, JSON.stringify({ savedAt: Date.now(), value: value })); } catch (e) {}
+          return value;
+        })
+        .catch(function () { return fallback; });
+    } catch (e) { request = Promise.resolve(fallback); }
+    return request;
+  }
+
+  function searchStoreGames(query) {
+    var language = "english";
+    try { language = pickLang() === "pt-BR" ? "brazilian" : "english"; } catch (e) {}
+    return call("SearchSteamGames", { query: query, language: language })
+      .then(parseRpc)
+      .then(function (data) {
+        return (Array.isArray(data && data.items) ? data.items : []).filter(function (item) {
+          return item && item.type === "app" && /^\d+$/.test(String(item.id));
+        }).slice(0, 8);
+      });
+  }
+
+  function renderStoreResults(container, items, onSelect, activeIndex) {
+    var GU = guStrings();
+    container.textContent = "";
+    container.className = "lumen-builder-results open";
+    if (!items.length) {
+      var empty = document.createElement("div");
+      empty.className = "lumen-builder-results-empty";
+      empty.textContent = GU.noGameResults;
+      container.appendChild(empty);
+      return;
+    }
+    items.forEach(function (item, index) {
+      var row = document.createElement("button");
+      row.type = "button"; row.className = "lumen-builder-result";
+      if (index === activeIndex) row.className += " selected";
+      row.setAttribute("role", "option");
+      row.setAttribute("aria-selected", index === activeIndex ? "true" : "false");
+      row.id = container.id + "-option-" + index;
+      row.title = GU.selectGame + ": " + item.name;
+      var image = document.createElement("img");
+      image.src = item.tiny_image || capsuleUrl(item.id); image.alt = "";
+      image.addEventListener("error", function () { image.style.visibility = "hidden"; });
+      var text = document.createElement("span");
+      var meta = document.createElement("strong"); meta.textContent = "AppID " + item.id;
+      var name = document.createElement("small"); name.textContent = item.name || ("App " + item.id);
+      text.appendChild(meta); text.appendChild(name);
+      row.appendChild(image); row.appendChild(text);
+      row.addEventListener("mousedown", function (event) { event.preventDefault(); });
+      row.addEventListener("click", function () { onSelect(Number(item.id)); });
+      container.appendChild(row);
+    });
+  }
+
+  function builderField(labelText, input) {
+    var field = document.createElement("label");
+    field.className = "lumen-builder-field";
+    var label = document.createElement("span");
+    label.textContent = labelText;
+    field.appendChild(label); field.appendChild(input);
+    return field;
+  }
+
+  function buildDraftLuaRequest(appid, dlcList, depotList) {
+    return {
+      appid: appid,
+      dlc_appids: dlcList.map(function (input) { return input.value.trim(); }).filter(Boolean),
+      depots: depotList.map(function (row) {
+        return { depot: row.depot.value.trim(), key: row.key.value.trim(), gid: row.gid.value.trim() };
+      }),
+    };
+  }
+
+  function renderGameCreatorEditor(body, source, details) {
+    var GU = guStrings();
+    var draft = source.draft || {};
+    var dlcInputs = [], depotRows = [];
+    var baseDepots = {};
+    (Array.isArray(draft.baseDepots) ? draft.baseDepots : []).forEach(function (id) {
+      baseDepots[String(id)] = true;
+    });
+    body.textContent = "";
+    guShowClearBtn(false);
+
+    var back = document.createElement("div");
+    back.className = "lumen-back";
+    back.textContent = "\u2190 " + GU.back;
+    back.addEventListener("click", function () {
+      call("CancelGameDraft", { appid: source.appid, session: source.session }).catch(function () {});
+      renderGameUpdates(body);
+    });
+    body.appendChild(back);
+
+    var builder = document.createElement("div");
+    builder.className = "lumen-game-builder";
+    var identity = document.createElement("div");
+    identity.className = "lumen-builder-identity";
+    var image = document.createElement("img");
+    image.src = details.image || capsuleUrl(source.appid);
+    image.alt = "";
+    image.addEventListener("error", function () { image.style.visibility = "hidden"; });
+    var identityText = document.createElement("div");
+    var gameName = document.createElement("div");
+    gameName.className = "lumen-builder-game-name";
+    gameName.textContent = details.name || ("App " + source.appid);
+    var gameMeta = document.createElement("div");
+    gameMeta.className = "lumen-builder-game-meta";
+    var contributors = Array.isArray(draft.contributors) ? draft.contributors : [];
+    gameMeta.textContent = "AppID " + source.appid
+      + (contributors.length ? "  ·  " + GU.sourcesLabel + ": " + contributors.join(", ") : "");
+    identityText.appendChild(gameName); identityText.appendChild(gameMeta);
+    identity.appendChild(image); identity.appendChild(identityText); builder.appendChild(identity);
+
+    var sectionTitle = function (text, description) {
+      var wrap = document.createElement("div");
+      wrap.className = "lumen-builder-section-head";
+      var title = document.createElement("div");
+      title.textContent = text;
+      var desc = document.createElement("small");
+      desc.textContent = description;
+      wrap.appendChild(title); wrap.appendChild(desc); builder.appendChild(wrap);
+    };
+
+    sectionTitle(GU.dlcApps, GU.dlcAppsDesc);
+    var dlcList = document.createElement("div");
+    dlcList.className = "lumen-builder-dlcs";
+    builder.appendChild(dlcList);
+    var addDlcRow = function (value, suggested) {
+      var row = document.createElement("div");
+      row.className = "lumen-builder-dlc";
+      var input = document.createElement("input");
+      input.type = "text"; input.inputMode = "numeric"; input.value = value || "";
+      input.placeholder = GU.dlcAppid;
+      var origin = document.createElement("small");
+      origin.textContent = suggested ? GU.storeSuggestion : GU.sourceValue;
+      var remove = document.createElement("button");
+      remove.type = "button"; remove.className = "lumen-icon-btn"; remove.textContent = "\u00d7";
+      remove.title = GU.remove;
+      remove.addEventListener("click", function () {
+        var index = dlcInputs.indexOf(input);
+        if (index !== -1) dlcInputs.splice(index, 1);
+        row.remove();
+      });
+      dlcInputs.push(input);
+      row.appendChild(input); row.appendChild(origin); row.appendChild(remove); dlcList.appendChild(row);
+    };
+    var sourceDlcs = Array.isArray(draft.dlc_appids) ? draft.dlc_appids.map(String) : [];
+    sourceDlcs.forEach(function (id) { addDlcRow(id, false); });
+    (details.dlc || []).map(String).filter(function (id) { return sourceDlcs.indexOf(id) === -1; })
+      .forEach(function (id) { addDlcRow(id, true); });
+    if (!dlcInputs.length) addDlcRow("", false);
+    var addDlc = document.createElement("button");
+    addDlc.type = "button"; addDlc.className = "lumen-builder-add";
+    addDlc.textContent = "+ " + GU.addDlc;
+    addDlc.addEventListener("click", function () { addDlcRow("", false); });
+    builder.appendChild(addDlc);
+
+    sectionTitle(GU.depotsAndVersions, GU.depotsAndVersionsDesc);
+    var depotList = document.createElement("div");
+    depotList.className = "lumen-builder-depots";
+    builder.appendChild(depotList);
+    var addDepotRow = function (data) {
+      data = data || {};
+      var isVirtual = data.virtualDepot === true;
+      var row = document.createElement("div");
+      row.className = "lumen-builder-depot" + (isVirtual ? " virtual" : "");
+      var top = document.createElement("div");
+      top.className = "lumen-builder-depot-top";
+      var depot = document.createElement("input");
+      depot.type = "text"; depot.inputMode = "numeric"; depot.value = data.depot || "";
+      depot.placeholder = GU.depotId;
+      var steamdb = document.createElement("a");
+      steamdb.target = "_blank"; steamdb.rel = "noopener noreferrer";
+      steamdb.textContent = GU.chooseVersion;
+      steamdb.addEventListener("click", function (event) {
+        var id = depot.value.trim();
+        if (!/^\d+$/.test(id)) { event.preventDefault(); return; }
+        event.preventDefault();
+        call("OpenExternalUrl", {
+          contentScriptQuery: "", url: "https://steamdb.info/depot/" + id + "/manifests/",
+        }).catch(function (e) { log("OpenExternalUrl", e); });
+      });
+      var syncLink = function () {
+        var id = depot.value.trim();
+        steamdb.href = /^\d+$/.test(id) ? "https://steamdb.info/depot/" + id + "/manifests/" : "#";
+        steamdb.classList.toggle("disabled", !/^\d+$/.test(id));
+      };
+      depot.addEventListener("input", syncLink); syncLink();
+      var packageBadge = document.createElement("span");
+      packageBadge.className = "lumen-builder-package";
+      packageBadge.textContent = isVirtual ? GU.virtualDlc
+        : (data.hasManifest ? GU.inPackage : GU.serverVersion);
+      var remove = document.createElement("button");
+      remove.type = "button"; remove.className = "lumen-icon-btn"; remove.textContent = "\u00d7";
+      remove.title = GU.remove;
+      top.appendChild(builderField(GU.depot, depot)); top.appendChild(packageBadge);
+      if (!isVirtual) top.appendChild(steamdb);
+      top.appendChild(remove);
+
+      var key = document.createElement("input");
+      key.type = "password"; key.value = data.key || ""; key.autocomplete = "off";
+      key.spellcheck = false; key.placeholder = GU.keyPlaceholder;
+      var keyWrap = document.createElement("div");
+      keyWrap.className = "lumen-builder-secret";
+      keyWrap.appendChild(key);
+      var reveal = document.createElement("button");
+      reveal.type = "button"; reveal.className = "lumen-secret-toggle"; reveal.textContent = GU.show;
+      reveal.addEventListener("click", function () {
+        var hidden = key.type === "password";
+        key.type = hidden ? "text" : "password";
+        reveal.textContent = hidden ? GU.hide : GU.show;
+      });
+      keyWrap.appendChild(reveal);
+      var gid = document.createElement("input");
+      gid.type = "text"; gid.inputMode = "numeric"; gid.value = data.gid || "";
+      gid.placeholder = GU.latestShort;
+      var fields = document.createElement("div");
+      fields.className = "lumen-builder-depot-fields";
+      if (isVirtual) {
+        key.type = "hidden"; gid.type = "hidden";
+        var virtualKey = document.createElement("div");
+        virtualKey.className = "lumen-virtual-key";
+        virtualKey.textContent = GU.virtualDlcNoKey;
+        fields.appendChild(virtualKey);
+      } else {
+        fields.appendChild(builderField(GU.depotKey, keyWrap));
+        fields.appendChild(builderField(GU.manifestGid, gid));
+        var initialGid = String(data.gid || "");
+        var syncManifestHint = function () {
+          var value = gid.value.trim();
+          var hint = !value ? GU.manifestLatestHint
+            : (data.manifestSource && value === initialGid
+              ? GU.manifestSourceHint.replace("{source}", data.manifestSource)
+              : GU.manifestManualHint);
+          steamdb.title = hint;
+          steamdb.setAttribute("aria-label", GU.chooseVersion + ". " + hint);
+        };
+        gid.addEventListener("input", syncManifestHint); syncManifestHint();
+      }
+      row.appendChild(top); row.appendChild(fields); depotList.appendChild(row);
+      var model = { root: row, depot: depot, key: key, gid: gid };
+      depotRows.push(model);
+      remove.addEventListener("click", function () {
+        var index = depotRows.indexOf(model);
+        if (index !== -1) depotRows.splice(index, 1);
+        row.remove();
+      });
+    };
+    (Array.isArray(draft.depots) ? draft.depots : []).forEach(addDepotRow);
+    if (!depotRows.length) addDepotRow({});
+    var addDepot = document.createElement("button");
+    addDepot.type = "button"; addDepot.className = "lumen-builder-add";
+    addDepot.textContent = "+ " + GU.addDepot;
+    addDepot.addEventListener("click", function () { addDepotRow({}); });
+    builder.appendChild(addDepot);
+
+    var latestNote = document.createElement("div");
+    latestNote.className = "lumen-builder-latest-note";
+    latestNote.textContent = GU.latestExplainer;
+    builder.appendChild(latestNote);
+    var error = document.createElement("div");
+    error.className = "lumen-err";
+    builder.appendChild(error);
+    var actions = document.createElement("div");
+    actions.className = "lumen-builder-actions";
+    var cancel = document.createElement("button");
+    cancel.className = "lumen-mbtn"; cancel.textContent = GU.cancel;
+    cancel.addEventListener("click", function () { back.click(); });
+    var committedResult = null;
+    var commit = document.createElement("button");
+    commit.className = "lumen-mbtn primary"; commit.textContent = GU.addGame;
+    commit.addEventListener("click", function () {
+      error.textContent = "";
+      var request = buildDraftLuaRequest(source.appid, dlcInputs, depotRows);
+      var invalidDlc = request.dlc_appids.some(function (id) { return !/^\d+$/.test(id); });
+      var invalidDepot = request.depots.some(function (row) {
+        return !/^\d+$/.test(row.depot) || (row.key && !/^[0-9a-fA-F]{64}$/.test(row.key))
+          || (row.gid && !/^\d+$/.test(row.gid));
+      });
+      var hasUsableBaseKey = request.depots.some(function (row) {
+        var validKey = /^[0-9a-fA-F]{64}$/.test(row.key);
+        return validKey && (!Object.keys(baseDepots).length || baseDepots[row.depot]);
+      });
+      if (invalidDlc || invalidDepot || !request.depots.length || !hasUsableBaseKey) {
+        error.textContent = GU.invalidDraft; return;
+      }
+      commit.disabled = true; commit.textContent = GU.addingGame;
+      var publish = committedResult ? Promise.resolve(committedResult) : call("CommitGameDraft", {
+        appid: source.appid, session: source.session,
+        editsJson: JSON.stringify({ dlc_appids: request.dlc_appids, depots: request.depots }),
+      }).then(parseRpc).then(function (result) { committedResult = result; return result; });
+      publish.then(function (result) {
+        if (result.pinsSynced) return result;
+        return call("SyncGamePins", { json: JSON.stringify({ appid: source.appid, lua: result.lua }) })
+          .then(parseRpc)
+          .then(function () {
+            return call("MarkLuaImport", { json: JSON.stringify({ appid: source.appid }) })
+              .then(parseRpc).then(function () { return result; });
+          });
+      }).then(function () {
+        cancelGameDraft(source.appid, source.session);
+        showConfirm({
+          title: GU.restartTitle, body: GU.addGameDone,
+          declineText: GU.restartLater, confirmText: GU.restartNow,
+          onConfirm: function () { call("RestartSteam", {}).catch(function (e) { log("RestartSteam", e); }); },
+        });
+        renderGameUpdates(body);
+      }).catch(function (e) {
+        commit.disabled = false; commit.textContent = GU.addGame;
+        error.textContent = GU.addGameFail + ((e && e.message) || e);
+      });
+    });
+    actions.appendChild(cancel); actions.appendChild(commit); builder.appendChild(actions);
+    body.appendChild(builder);
+  }
+
+  function renderGameCreator(body) {
+    var GU = guStrings();
+    body.textContent = "";
+    guShowClearBtn(false);
+    var cancelled = false, active = null;
+    var back = document.createElement("div");
+    back.className = "lumen-back"; back.textContent = "\u2190 " + GU.back;
+    back.addEventListener("click", function () {
+      cancelled = true;
+      if (active) cancelGameDraft(active.appid, active.session);
+      renderGameUpdates(body);
+    });
+    body.appendChild(back);
+    var title = document.createElement("div");
+    title.className = "lumen-sub-title"; title.textContent = GU.addGame;
+    body.appendChild(title);
+    var intro = document.createElement("div");
+    intro.className = "lumen-note"; intro.textContent = GU.addGameIntro;
+    body.appendChild(intro);
+    var lookup = document.createElement("div");
+    lookup.className = "lumen-builder-lookup";
+    var searchbox = document.createElement("div");
+    searchbox.className = "lumen-builder-searchbox";
+    var appid = document.createElement("input");
+    appid.type = "search"; appid.inputMode = "search"; appid.placeholder = GU.appidPlaceholder;
+    appid.setAttribute("role", "combobox");
+    appid.setAttribute("aria-autocomplete", "list");
+    appid.setAttribute("aria-expanded", "false");
+    appid.setAttribute("aria-controls", "lumen-game-suggestions");
+    var search = document.createElement("button");
+    search.className = "lumen-mbtn primary"; search.textContent = GU.searchSources;
+    var status = document.createElement("div");
+    status.className = "lumen-builder-status";
+    var error = document.createElement("div");
+    error.className = "lumen-err";
+    var results = document.createElement("div");
+    results.className = "lumen-builder-results";
+    results.id = "lumen-game-suggestions";
+    results.setAttribute("role", "listbox");
+    searchbox.appendChild(appid); searchbox.appendChild(results);
+    lookup.appendChild(searchbox); lookup.appendChild(search); body.appendChild(lookup);
+    body.appendChild(status); body.appendChild(error);
+    appid.focus();
+    var searchTimer = null, searchGeneration = 0, suggestions = [], activeIndex = -1;
+    var closeStoreResults = function () {
+      results.className = "lumen-builder-results";
+      results.textContent = "";
+      suggestions = []; activeIndex = -1;
+      appid.setAttribute("aria-expanded", "false");
+      appid.removeAttribute("aria-activedescendant");
+    };
+    var selectSuggestion = function (id) {
+      closeStoreResults(); appid.value = String(id); openApp(id);
+    };
+    var showStoreMessage = function (message, className) {
+      results.textContent = "";
+      results.className = "lumen-builder-results open";
+      var row = document.createElement("div");
+      row.className = className || "lumen-builder-results-empty";
+      row.textContent = message; results.appendChild(row);
+      appid.setAttribute("aria-expanded", "true");
+    };
+    var paintSuggestions = function () {
+      renderStoreResults(results, suggestions, selectSuggestion, activeIndex);
+      appid.setAttribute("aria-expanded", "true");
+      if (activeIndex >= 0) {
+        appid.setAttribute("aria-activedescendant", results.id + "-option-" + activeIndex);
+      } else appid.removeAttribute("aria-activedescendant");
+    };
+    var requestGameSearch = function (query) {
+      var generation = ++searchGeneration;
+      showStoreMessage(GU.searchingGames, "lumen-builder-results-empty loading");
+      return searchStoreGames(query).then(function (items) {
+        if (generation !== searchGeneration || appid.value.trim() !== query) return;
+        suggestions = items; activeIndex = -1; paintSuggestions();
+      }).catch(function () {
+        if (generation !== searchGeneration) return;
+        suggestions = []; activeIndex = -1;
+        showStoreMessage(GU.gameSearchFail, "lumen-builder-results-empty error");
+      });
+    };
+    var runScheduledGameSearch = function () {
+      searchTimer = null;
+      var query = appid.value.trim();
+      if (query.length >= 2 && !/^\d+$/.test(query)) requestGameSearch(query);
+    };
+    var scheduleGameSearch = function () {
+      if (searchTimer) clearTimeout(searchTimer);
+      searchGeneration += 1;
+      var query = appid.value.trim();
+      if (query.length < 2 || /^\d+$/.test(query)) { closeStoreResults(); return; }
+      searchTimer = setTimeout(runScheduledGameSearch, 280);
+    };
+    var openApp = function (id) {
+      if (searchTimer) clearTimeout(searchTimer);
+      closeStoreResults(); error.textContent = "";
+      search.disabled = true; appid.disabled = true;
+      status.className = "lumen-builder-status loading";
+      status.innerHTML = '<span class="lumen-spin"></span><span></span>';
+      status.lastChild.textContent = GU.loadChecking;
+      call("StartGameDraft", { appid: id }).then(parseRpc).then(function (start) {
+        active = { appid: id, session: start.session };
+        if (cancelled) {
+          call("CancelGameDraft", { appid: id, session: start.session }).catch(function () {});
+          return Promise.reject(new Error("cancelled"));
+        }
+        return pollGameDraft(id, start.session, function (state) {
+          if (!status.lastChild) return;
+          status.lastChild.textContent = sourceProgressMessage(state);
+        }).then(function (draft) { return { draft: draft, session: start.session }; });
+      }).then(function (source) {
+        if (cancelled) return;
+        active = { appid: id, session: source.session, draft: source.draft };
+        status.lastChild.textContent = GU.loadingDetails;
+        return fetchAppDetails(id).then(function (details) {
+          if (!cancelled) renderGameCreatorEditor(body, active, details);
+        });
+      }).catch(function (e) {
+        if (cancelled) return;
+        if (active) cancelGameDraft(active.appid, active.session);
+        search.disabled = false; appid.disabled = false;
+        status.textContent = ""; status.className = "lumen-builder-status";
+        error.textContent = e && e.code === "not_found"
+          ? GU.sourceNotFound : GU.sourceFail + " " + ((e && e.message) || e);
+      });
+    };
+    var run = function () {
+      var query = appid.value.trim();
+      if (!query) { error.textContent = GU.invalidAppid; return; }
+      if (/^\d+$/.test(query) && query !== "0") { openApp(Number(query)); return; }
+      error.textContent = "";
+      if (searchTimer) clearTimeout(searchTimer);
+      requestGameSearch(query);
+    };
+    search.addEventListener("click", run);
+    appid.addEventListener("input", scheduleGameSearch);
+    appid.addEventListener("blur", function () { setTimeout(closeStoreResults, 120); });
+    appid.addEventListener("keydown", function (event) {
+      if ((event.key === "ArrowDown" || event.key === "ArrowUp") && suggestions.length) {
+        event.preventDefault();
+        activeIndex += event.key === "ArrowDown" ? 1 : -1;
+        if (activeIndex < 0) activeIndex = suggestions.length - 1;
+        if (activeIndex >= suggestions.length) activeIndex = 0;
+        paintSuggestions(); return;
+      }
+      if (event.key === "Escape") { closeStoreResults(); return; }
+      if (event.key === "Enter") {
+        event.preventDefault();
+        if (activeIndex >= 0 && suggestions[activeIndex]) {
+          selectSuggestion(Number(suggestions[activeIndex].id));
+        } else run();
+      }
+    });
   }
 
   function renderGameUpdates(body) {
@@ -536,7 +1108,7 @@
     note.textContent = GU.note;
     body.appendChild(note);
 
-    body.appendChild(loadLuaButton(body));
+    body.appendChild(gameUpdateActions(body));
 
     var search = document.createElement("input");
     search.type = "text";
@@ -603,4 +1175,3 @@
         listWrap.appendChild(err);
       });
   }
-

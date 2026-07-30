@@ -136,6 +136,350 @@ function mp.parse_lua(text)
   return out
 end
 
+local function lua_long_open(line, pos)
+  local equals = line:sub(pos):match("^%[(=*)%[")
+  if equals == nil then return nil end
+  return "]" .. equals .. "]", #equals + 2
+end
+
+-- Removes comments and long bracket strings while preserving ordinary quoted
+-- arguments. The returned state carries a multiline block across input lines.
+local function strip_lua_non_code(line, long_close)
+  local out, pos = {}, 1
+  while pos <= #line do
+    if long_close then
+      local first, last = line:find(long_close, pos, true)
+      if not first then return table.concat(out), long_close end
+      out[#out + 1] = " "
+      pos, long_close = last + 1, nil
+    else
+      local ch = line:sub(pos, pos)
+      if ch == '"' or ch == "'" then
+        local quote, escaped = ch, false
+        out[#out + 1] = ch
+        pos = pos + 1
+        while pos <= #line do
+          ch = line:sub(pos, pos)
+          out[#out + 1] = ch
+          pos = pos + 1
+          if escaped then escaped = false
+          elseif ch == "\\" then escaped = true
+          elseif ch == quote then break end
+        end
+      elseif line:sub(pos, pos + 1) == "--" then
+        local close, width = lua_long_open(line, pos + 2)
+        if not close then break end
+        out[#out + 1] = " "
+        long_close, pos = close, pos + 2 + width
+      else
+        local close, width = lua_long_open(line, pos)
+        if close then
+          out[#out + 1] = " "
+          long_close, pos = close, pos + width
+        else
+          out[#out + 1] = ch
+          pos = pos + 1
+        end
+      end
+    end
+  end
+  return table.concat(out), long_close
+end
+
+-- Strict data parser for files crossing an import boundary. Unlike parse_lua,
+-- this never treats comments or calls embedded in strings/other expressions as
+-- declarations. parse_lua remains intentionally permissive for reading legacy
+-- installed LuaTools files whose build marker may be commented out.
+function mp.parse_lua_strict(text)
+  local out = { base = nil, depots = {}, dlc_appids = {} }
+  local bare, long_close = {}, nil
+  for raw in (tostring(text or "") .. "\n"):gmatch("([^\n]*)\n") do
+    local cleaned
+    cleaned, long_close = strip_lua_non_code(raw:gsub("\r$", ""), long_close)
+    local line = cleaned:match("^%s*(.-)%s*$")
+    local bid = line:match("^addappid%s*%(%s*(%d+)%s*%)%s*;?%s*$")
+    if bid then
+      bare[#bare + 1] = math.tointeger(tonumber(bid))
+    else
+      local kid, _, quote, kkey = line:match(
+        "^addappid%s*%(%s*(%d+)%s*,%s*(%d+)%s*,%s*(['\"])([0-9A-Fa-f]+)%3%s*%)%s*;?%s*$")
+      if kid then
+        kid = math.tointeger(tonumber(kid))
+        out.depots[kid] = out.depots[kid] or {}
+        out.depots[kid].key = kkey
+      else
+        local mdepot, mquote, mgid, tail = line:match(
+          "^setManifestid%s*%(%s*(%d+)%s*,%s*(['\"])(%d+)%2%s*(.-)%)%s*;?%s*$")
+        if mdepot and (tail == "" or tail:match("^,%s*%d+%s*$")) then
+          mdepot = math.tointeger(tonumber(mdepot))
+          out.depots[mdepot] = out.depots[mdepot] or {}
+          out.depots[mdepot].manifestid = mgid
+        end
+      end
+    end
+  end
+  if bare[1] then out.base = bare[1] end
+  for i = 2, #bare do
+    if bare[i] ~= out.base then out.dlc_appids[#out.dlc_appids + 1] = bare[i] end
+  end
+  return out
+end
+
+local function positive_id(value)
+  local text = tostring(value or "")
+  if not text:match("^%d+$") then return nil end
+  local n = math.tointeger(tonumber(text))
+  if not n or n <= 0 then return nil end
+  return n
+end
+
+local function decimal_id(value)
+  local text = tostring(value or "")
+  if not text:match("^%d+$") then return nil end
+  text = text:gsub("^0+", "")
+  if text == "" then return nil end
+  local maximum = "18446744073709551615"
+  if #text > #maximum or (#text == #maximum and text > maximum) then return nil end
+  return text
+end
+
+local function valid_depot_key(value)
+  return type(value) == "string" and #value == 64
+    and value:match("^[0-9A-Fa-f]+$") ~= nil
+end
+
+local function sorted_numeric_keys(map)
+  local keys = {}
+  for key in pairs(map or {}) do keys[#keys + 1] = key end
+  table.sort(keys)
+  return keys
+end
+
+-- merge_lua_text(appid, ...texts) -> canonical Lua, err. This is deliberately
+-- data-only: only recognized addappid/setManifestid declarations survive, so a
+-- selected file can never inject arbitrary Lua into Steam's startup path.
+function mp.merge_lua_text(appid, ...)
+  appid = positive_id(appid)
+  if not appid then return nil, "invalid appid" end
+  local bare, keys, manifests = { [appid] = true }, {}, {}
+  for _, text in ipairs({ ... }) do
+    if type(text) == "string" and text ~= "" then
+      local parsed = mp.parse_lua_strict(text)
+      if parsed.base and parsed.base ~= appid then
+        return nil, "Lua declares app " .. parsed.base .. ", expected " .. appid
+      end
+      if not parsed.base and next(parsed.depots) == nil then
+        return nil, "Lua has no recognized game declarations"
+      end
+      for _, id in ipairs(parsed.dlc_appids or {}) do bare[id] = true end
+      for depot, info in pairs(parsed.depots or {}) do
+        if info.key then
+          if not valid_depot_key(info.key) then
+            return nil, "invalid key for depot " .. depot
+          end
+          local normalized = info.key:lower()
+          if keys[depot] and keys[depot] ~= normalized then
+            return nil, "conflicting keys for depot " .. depot
+          end
+          keys[depot] = normalized
+        end
+        if info.manifestid then
+          local gid = decimal_id(info.manifestid)
+          if not gid then return nil, "invalid manifest gid for depot " .. depot end
+          manifests[depot] = gid -- later input is the user's explicit choice
+        end
+      end
+    end
+  end
+  local lines = { "addappid(" .. appid .. ")" }
+  for _, id in ipairs(sorted_numeric_keys(bare)) do
+    if id ~= appid then lines[#lines + 1] = "addappid(" .. id .. ")" end
+  end
+  for _, depot in ipairs(sorted_numeric_keys(keys)) do
+    lines[#lines + 1] = string.format('addappid(%d,1,"%s")', depot, keys[depot])
+  end
+  for _, depot in ipairs(sorted_numeric_keys(manifests)) do
+    lines[#lines + 1] = string.format('setManifestid(%d,"%s")', depot, manifests[depot])
+  end
+  return table.concat(lines, "\n") .. "\n"
+end
+
+-- build_draft_lua(request) -> canonical Lua, err. Blank manifest GIDs are an
+-- intentional "Latest" selection and therefore emit no setManifestid line.
+function mp.build_draft_lua(request)
+  if type(request) ~= "table" then return nil, "bad request" end
+  local appid = positive_id(request.appid)
+  if not appid then return nil, "invalid appid" end
+  local lines = { "addappid(" .. appid .. ")" }
+  local dlcs = {}
+  for _, value in ipairs(type(request.dlc_appids) == "table" and request.dlc_appids or {}) do
+    local id = positive_id(value)
+    if not id then return nil, "invalid DLC appid" end
+    if id ~= appid then dlcs[id] = true end
+  end
+  for _, id in ipairs(sorted_numeric_keys(dlcs)) do
+    lines[#lines + 1] = "addappid(" .. id .. ")"
+  end
+  local pins = {}
+  for _, pin in ipairs(type(request.pins) == "table" and request.pins or {}) do
+    if type(pin) ~= "table" then return nil, "invalid pin" end
+    local raw_depot = tostring(pin.depot or ""):match("^%s*(.-)%s*$")
+    local raw_gid = tostring(pin.gid or ""):match("^%s*(.-)%s*$")
+    if raw_depot ~= "" or raw_gid ~= "" then
+      local depot = positive_id(raw_depot)
+      if not depot then return nil, "invalid depot id" end
+      if raw_gid ~= "" then
+        local gid = decimal_id(raw_gid)
+        if not gid then return nil, "invalid manifest gid" end
+        pins[depot] = gid
+      end
+    end
+  end
+  for _, depot in ipairs(sorted_numeric_keys(pins)) do
+    lines[#lines + 1] = string.format('setManifestid(%d,"%s")', depot, pins[depot])
+  end
+  return table.concat(lines, "\n") .. "\n"
+end
+
+local function manifest_u32le(bytes, pos)
+  local a, b, c, d = bytes:byte(pos, pos + 3)
+  if not d then return nil end
+  return a + b * 256 + c * 65536 + d * 16777216
+end
+
+local function decimal_mul_add(text, multiplier, addend)
+  local reversed, carry = {}, addend
+  for i = #text, 1, -1 do
+    local value = tonumber(text:sub(i, i)) * multiplier + carry
+    reversed[#reversed + 1] = tostring(value % 10)
+    carry = math.floor(value / 10)
+  end
+  while carry > 0 do
+    reversed[#reversed + 1] = tostring(carry % 10)
+    carry = math.floor(carry / 10)
+  end
+  local forward = {}
+  for i = #reversed, 1, -1 do forward[#forward + 1] = reversed[i] end
+  return table.concat(forward):gsub("^0+", ""):gsub("^$", "0")
+end
+
+local function read_decimal_varint(bytes, pos, limit)
+  local chunks = {}
+  for _ = 1, 10 do
+    if pos > limit then return nil, pos end
+    local byte = bytes:byte(pos); pos = pos + 1
+    chunks[#chunks + 1] = byte & 0x7f
+    if byte < 0x80 then
+      local decimal = "0"
+      for i = #chunks, 1, -1 do
+        decimal = decimal_mul_add(decimal, 128, chunks[i])
+      end
+      return decimal, pos
+    end
+  end
+  return nil, pos
+end
+
+local function parse_manifest_metadata(bytes, first, last)
+  local metadata, pos = {}, first
+  while pos <= last do
+    local tag_text; tag_text, pos = read_decimal_varint(bytes, pos, last)
+    local tag = tonumber(tag_text)
+    if not tag then return nil, "invalid protobuf tag" end
+    local field, wire = math.floor(tag / 8), tag % 8
+    if wire == 0 then
+      local value; value, pos = read_decimal_varint(bytes, pos, last)
+      if not value then return nil, "truncated protobuf varint" end
+      if field == 1 then metadata.depot = positive_id(value)
+      elseif field == 2 then metadata.gid = decimal_id(value)
+      elseif field == 3 then metadata.creation_time = tonumber(value) end
+    elseif wire == 1 then pos = pos + 8
+    elseif wire == 2 then
+      local length; length, pos = read_decimal_varint(bytes, pos, last)
+      length = tonumber(length)
+      if not length then return nil, "invalid protobuf length" end
+      pos = pos + length
+    elseif wire == 5 then pos = pos + 4
+    else return nil, "unsupported protobuf wire type" end
+    if pos > last + 1 then return nil, "truncated protobuf field" end
+  end
+  return metadata
+end
+
+-- parse_manifest(bytes [, expected_depot, expected_gid]) -> metadata, err.
+-- Unlike creation_time_from_bytes, this validates the complete section stream
+-- and payload marker before imported bytes can be archived. Steam manifests may
+-- omit the otherwise-common terminal marker, so a clean section boundary at EOF
+-- is accepted too.
+function mp.parse_manifest(bytes, expected_depot, expected_gid)
+  if type(bytes) ~= "string" then return nil, "manifest is not binary data" end
+  local pos, saw_payload, metadata = 1, false, nil
+  while pos <= #bytes do
+    local magic = manifest_u32le(bytes, pos)
+    if not magic then return nil, "truncated manifest section" end
+    if magic == 0x32C415AB then
+      if pos + 3 ~= #bytes then return nil, "terminal marker is not final" end
+      pos = pos + 4; break
+    end
+    local length = manifest_u32le(bytes, pos + 4)
+    if not length then return nil, "truncated manifest section" end
+    local first, last = pos + 8, pos + 7 + length
+    if last > #bytes then return nil, "manifest section exceeds file" end
+    if magic == 0x71F617D0 then saw_payload = true
+    elseif magic == 0x1F4812BE then
+      local perr; metadata, perr = parse_manifest_metadata(bytes, first, last)
+      if not metadata then return nil, perr end
+    end
+    pos = last + 1
+  end
+  if not saw_payload then return nil, "missing payload section" end
+  if not metadata or not metadata.depot or not metadata.gid then
+    return nil, "missing manifest metadata"
+  end
+  local depot = expected_depot ~= nil and positive_id(expected_depot) or nil
+  local gid = expected_gid ~= nil and decimal_id(expected_gid) or nil
+  if expected_depot ~= nil and not depot then return nil, "invalid expected depot" end
+  if expected_gid ~= nil and not gid then return nil, "invalid expected gid" end
+  if depot and metadata.depot ~= depot then return nil, "depot mismatch" end
+  if gid and metadata.gid ~= gid then return nil, "gid mismatch" end
+  return metadata
+end
+
+-- Read-only inspection used by both tests and the transactional importer.
+function mp.inspect_import_entries(entries)
+  local out = { luas = {}, manifests = {}, warnings = {} }
+  local manifests_by_name = {}
+  for _, entry in ipairs(type(entries) == "table" and entries or {}) do
+    local name, data = tostring(entry.name or ""), entry.data
+    local lower = name:lower()
+    if lower:match("%.lua$") then
+      local parsed = mp.parse_lua_strict(type(data) == "string" and data or "")
+      if not parsed.base then return nil, "could not determine app id from " .. name end
+      out.luas[#out.luas + 1] = { name = name, appid = parsed.base, data = data, parsed = parsed }
+    elseif lower:match("%.manifest$") then
+      local meta, err = mp.parse_manifest(data)
+      if not meta then return nil, name .. ": " .. tostring(err) end
+      local canonical = meta.depot .. "_" .. meta.gid .. ".manifest"
+      local previous = manifests_by_name[canonical]
+      if previous and previous.data ~= data then
+        return nil, "conflicting manifests for depot " .. meta.depot .. " gid " .. meta.gid
+      elseif not previous then
+        local item = {
+        source_name = name,
+        name = canonical,
+        depot = meta.depot, gid = meta.gid,
+        creation_time = meta.creation_time, data = data,
+        }
+        manifests_by_name[canonical] = item
+        out.manifests[#out.manifests + 1] = item
+      end
+    else
+      out.warnings[#out.warnings + 1] = "Ignored " .. name
+    end
+  end
+  return out
+end
+
 -- ── Load-.lua import marker ───────────────────────────────────────────────
 -- Games added through the menu's "Load .lua" button (vs the LuaTools database)
 -- are recorded, one appid per line, in <SLSsteam>/lumen_lua_imports.txt. This is
@@ -551,6 +895,7 @@ function mp.default_ctx()
     manifests_dir = (h ~= "" and (h .. "/.config/SLSsteam/manifests")) or nil,
     cache_dir = (h ~= "" and (h .. "/.config/SLSsteam/cache")) or nil,
     imports_path = (h ~= "" and (h .. "/.config/SLSsteam/lumen_lua_imports.txt")) or nil,
+    import_root = (h ~= "" and (h .. "/.local/share/Lumen/imports")) or nil,
     steam_root = root,
   }
 end
@@ -1004,6 +1349,438 @@ end
 local function err(msg) return json.encode({ success = false, error = tostring(msg) }) end
 local function as_int(v) return math.tointeger(tonumber(v)) end
 
+-- ── Transactional multi-file importer ─────────────────────────────────────
+-- Files cross the CDP binding as small base64 chunks. The backend stores each
+-- upload in a private session, inspects every Lua/manifest/ZIP before writing
+-- live state, then stages all destination files and rolls back on publication
+-- failure. ZIP entries are streamed with `unzip -p`; paths are never extracted.
+local IMPORT_MAX_FILES = 128
+local IMPORT_MAX_FILE = 256 * 1024 * 1024
+local IMPORT_MAX_TOTAL = 512 * 1024 * 1024
+local IMPORT_MAX_CHUNK = 256 * 1024
+local IMPORT_MAX_ENTRIES = 512
+
+local function shell_quote(value)
+  return "'" .. tostring(value or ""):gsub("'", "'\\''") .. "'"
+end
+
+local function mkdir_p(path)
+  if not path or path == "" then return false end
+  return os.execute("mkdir -p -- " .. shell_quote(path) .. " 2>/dev/null") == true
+end
+
+local function private_dir(path, create)
+  if not path or path == "" then return false end
+  local command = create and "mkdir -p -m 700 -- " or "chmod 700 -- "
+  if os.execute(command .. shell_quote(path) .. " 2>/dev/null") ~= true then return false end
+  -- `mkdir -p -m` does not tighten an already-existing directory.
+  return os.execute("chmod 700 -- " .. shell_quote(path) .. " 2>/dev/null") == true
+end
+
+local function import_session_dir(ctx, session)
+  if type(session) ~= "string" or not session:match("^[a-z0-9]+$") then return nil end
+  if not ctx.import_root then return nil end
+  return ctx.import_root .. "/" .. session
+end
+
+local function import_state_path(ctx, session)
+  local dir = import_session_dir(ctx, session)
+  return dir and (dir .. "/state.json") or nil
+end
+
+local function write_plain_atomic(path, data)
+  local tmp = path .. ".tmp." .. tostring(os.time()) .. "." .. tostring(math.random(100000, 999999))
+  local f, ferr = io.open(tmp, "wb")
+  if not f then return false, ferr or "open failed" end
+  if os.execute("chmod 600 -- " .. shell_quote(tmp) .. " 2>/dev/null") ~= true then
+    f:close(); os.remove(tmp); return false, "could not protect temporary file"
+  end
+  local ok, werr = f:write(data); f:close()
+  if not ok then os.remove(tmp); return false, werr or "write failed" end
+  local renamed, rerr = os.rename(tmp, path)
+  if not renamed then os.remove(tmp); return false, rerr or "rename failed" end
+  return true
+end
+
+local function read_import_state(ctx, session)
+  local raw = read_file(import_state_path(ctx, session))
+  if not raw then return nil, "unknown or expired import session" end
+  local ok, state = pcall(json.decode, raw)
+  if not ok or type(state) ~= "table" or type(state.files) ~= "table" then
+    return nil, "corrupt import session"
+  end
+  return state
+end
+
+local function write_import_state(ctx, session, state)
+  return write_plain_atomic(import_state_path(ctx, session), json.encode(state))
+end
+
+local function remove_tree(path)
+  if not path then return end
+  local ok_lfs, lfs = pcall(require, "lfs")
+  if not ok_lfs then return end
+  local mode = lfs.attributes(path, "mode")
+  if mode == "directory" then
+    for entry in lfs.dir(path) do
+      if entry ~= "." and entry ~= ".." then remove_tree(path .. "/" .. entry) end
+    end
+    lfs.rmdir(path)
+  elseif mode then os.remove(path) end
+end
+
+local function safe_import_name(name)
+  name = tostring(name or ""):gsub("\\", "/")
+  local base = name:match("([^/]+)$") or ""
+  if base == "" or base == "." or base == ".." or base:find("[%z\r\n]") then return nil end
+  local lower = base:lower()
+  if not (lower:match("%.lua$") or lower:match("%.manifest$") or lower:match("%.zip$")) then
+    return nil
+  end
+  return base
+end
+
+function mp.begin_game_import_rpc(ctx, json_str)
+  ctx = ctx or mp.default_ctx()
+  local ok, req = pcall(json.decode, json_str)
+  if not ok or type(req) ~= "table" or type(req.files) ~= "table"
+      or #req.files < 1 or #req.files > IMPORT_MAX_FILES then return err("invalid file list") end
+  local files, total = {}, 0
+  for index, item in ipairs(req.files) do
+    local name = type(item) == "table" and safe_import_name(item.name) or nil
+    local size = type(item) == "table" and as_int(item.size) or nil
+    if not name then return err("unsupported file name at item " .. index) end
+    if not size or size < 0 or size > IMPORT_MAX_FILE then return err("file is too large") end
+    total = total + size
+    if total > IMPORT_MAX_TOTAL then return err("selection is too large") end
+    files[index] = { name = name, size = size, received = 0, next_chunk = 0, complete = false }
+  end
+  if not private_dir(ctx.import_root, true) then return err("could not create private import area") end
+  local session
+  for _ = 1, 10 do
+    session = string.format("%x%x", os.time(), math.random(0x100000, 0xffffff))
+    local dir = import_session_dir(ctx, session)
+    -- The parent exists; plain mkdir succeeds only for a fresh name, which
+    -- makes session allocation collision-safe without requiring lfs in host
+    -- tests (the shipped runtime has it, but this primitive does not need it).
+    if os.execute("mkdir -m 700 -- " .. shell_quote(dir) .. " 2>/dev/null") == true then break end
+    session = nil
+  end
+  if not session then return err("could not allocate import session") end
+  local state = { files = files, total = total, prepared = false }
+  local wok, werr = write_import_state(ctx, session, state)
+  if not wok then remove_tree(import_session_dir(ctx, session)); return err(werr) end
+  return json.encode({ success = true, session = session })
+end
+
+function mp.upload_game_import_chunk_rpc(ctx, json_str)
+  ctx = ctx or mp.default_ctx()
+  local ok, req = pcall(json.decode, json_str)
+  if not ok or type(req) ~= "table" then return err("bad request") end
+  local state, serr = read_import_state(ctx, req.session)
+  if not state then return err(serr) end
+  local index, chunk = as_int(req.file), as_int(req.chunk)
+  local item = index and state.files[index] or nil
+  if not item or item.complete then return err("invalid upload target") end
+  if chunk ~= item.next_chunk then return err("out-of-order upload chunk") end
+  local b64 = require("b64")
+  local bytes = b64.decode(req.data)
+  if not bytes or #bytes > IMPORT_MAX_CHUNK then return err("invalid upload chunk") end
+  local previous_size = item.received
+  local next_size = previous_size + #bytes
+  if next_size > item.size then return err("upload exceeds declared size") end
+  if req.final == true and next_size ~= item.size then return err("upload size mismatch") end
+  if req.final ~= true and next_size == item.size then return err("final chunk flag missing") end
+  local path = import_session_dir(ctx, req.session) .. "/file_" .. index
+  local f, ferr = io.open(path, previous_size == 0 and "wb" or "ab")
+  if not f then return err(ferr or "could not store upload") end
+  if previous_size == 0
+      and os.execute("chmod 600 -- " .. shell_quote(path) .. " 2>/dev/null") ~= true then
+    f:close(); os.remove(path); return err("could not protect upload")
+  end
+  local wrote, werr = f:write(bytes); f:close()
+  if not wrote then return err(werr or "could not store upload") end
+  item.received = next_size
+  item.next_chunk = item.next_chunk + 1
+  item.complete = req.final == true
+  state.prepared = false
+  local sw, se = write_import_state(ctx, req.session, state)
+  if not sw then
+    os.execute("truncate -s " .. previous_size .. " -- " .. shell_quote(path) .. " 2>/dev/null")
+    return err(se)
+  end
+  return json.encode({ success = true, received = item.received })
+end
+
+function mp.cancel_game_import_rpc(ctx, json_str)
+  ctx = ctx or mp.default_ctx()
+  local ok, req = pcall(json.decode, json_str)
+  if not ok or type(req) ~= "table" then return err("bad request") end
+  local dir = import_session_dir(ctx, req.session)
+  if not dir or not read_file(import_state_path(ctx, req.session)) then
+    return err("unknown or expired import session")
+  end
+  remove_tree(dir)
+  return json.encode({ success = true })
+end
+
+local function zip_entry_safe(name)
+  if type(name) ~= "string" or name == "" or name:sub(1, 1) == "/"
+      or name:find("\\", 1, true) or name:find("[%z\r\n]") then return false end
+  for part in name:gmatch("[^/]+") do if part == ".." then return false end end
+  return true
+end
+
+local function read_pipe_limited(command, limit)
+  local p = io.popen(command, "r")
+  if not p then return nil, "could not run unzip" end
+  local data = p:read(limit + 1) or ""
+  local ok = p:close()
+  if #data > limit then return nil, "archive entry is too large" end
+  if ok == nil or ok == false then return nil, "could not read archive entry" end
+  return data
+end
+
+local function collect_import_entries(ctx, session, state)
+  local entries, total, count = {}, 0, 0
+  local dir = import_session_dir(ctx, session)
+  for index, item in ipairs(state.files) do
+    if not item.complete or item.received ~= item.size then return nil, "upload is incomplete" end
+    local path = dir .. "/file_" .. index
+    if item.name:lower():match("%.zip$") then
+      local list = io.popen("unzip -Z1 -- " .. shell_quote(path) .. " 2>/dev/null", "r")
+      if not list then return nil, "could not inspect ZIP" end
+      local names, listed_count, too_many = {}, 0, false
+      for name in list:lines() do
+        listed_count = listed_count + 1
+        if listed_count <= IMPORT_MAX_ENTRIES then names[#names + 1] = name
+        else too_many = true end
+      end
+      local listed_ok = list:close()
+      if listed_ok == nil or listed_ok == false then return nil, "invalid ZIP archive" end
+      if too_many then return nil, "too many archive entries" end
+      for _, name in ipairs(names) do
+        if not zip_entry_safe(name) then return nil, "unsafe ZIP entry: " .. tostring(name) end
+        local lower = name:lower()
+        if not name:match("/$") and (lower:match("%.lua$") or lower:match("%.manifest$")) then
+          count = count + 1
+          if count > IMPORT_MAX_ENTRIES then return nil, "too many archive entries" end
+          local data, zerr = read_pipe_limited(
+            "unzip -p -- " .. shell_quote(path) .. " " .. shell_quote(name) .. " 2>/dev/null",
+            IMPORT_MAX_FILE)
+          if not data then return nil, zerr end
+          total = total + #data
+          if total > IMPORT_MAX_TOTAL then return nil, "expanded package is too large" end
+          entries[#entries + 1] = { name = name, data = data }
+        end
+      end
+    else
+      local data = read_file(path)
+      if not data or #data ~= item.size then return nil, "stored upload size mismatch" end
+      total = total + #data; count = count + 1
+      entries[#entries + 1] = { name = item.name, data = data }
+    end
+  end
+  if #entries == 0 then return nil, "no .lua or .manifest files found" end
+  return entries
+end
+
+local function build_import_plan(ctx, session, state)
+  local entries, cerr = collect_import_entries(ctx, session, state)
+  if not entries then return nil, cerr end
+  local inspected, ierr = mp.inspect_import_entries(entries)
+  if not inspected then return nil, ierr end
+  local grouped = {}
+  for _, item in ipairs(inspected.luas) do
+    grouped[item.appid] = grouped[item.appid] or {}
+    grouped[item.appid][#grouped[item.appid] + 1] = item.data
+  end
+  -- Source enrichment is stored as validated, data-only Lua in the private
+  -- import session. Merge it first so uploaded declarations retain the final
+  -- say on manifest pins while missing keys/DLC declarations are filled in.
+  for appid_text, text in pairs(type(state.enrichment) == "table" and state.enrichment or {}) do
+    local appid = positive_id(appid_text)
+    if appid and grouped[appid] and type(text) == "string" then
+      table.insert(grouped[appid], 1, text)
+    end
+  end
+  local apps = {}
+  for appid, texts in pairs(grouped) do
+    local merged, merr = mp.merge_lua_text(appid, table.unpack(texts))
+    if not merged then return nil, merr end
+    local parsed = mp.parse_lua(merged)
+    local pin_count = 0
+    for _, info in pairs(parsed.depots) do if info.manifestid then pin_count = pin_count + 1 end end
+    apps[#apps + 1] = {
+      appid = appid, text = merged, pins = pin_count,
+      installed = next(installed_gids(ctx.steam_root, appid)) ~= nil,
+    }
+  end
+  table.sort(apps, function(a, b) return a.appid < b.appid end)
+  table.sort(inspected.manifests, function(a, b)
+    return a.depot == b.depot and a.gid < b.gid or a.depot < b.depot
+  end)
+  return { apps = apps, manifests = inspected.manifests, warnings = inspected.warnings }
+end
+
+-- EnrichGameImport{session, appid, lua}: attach the canonical source-generated
+-- Lua to an uploaded app without publishing it. The next Prepare/Commit merges
+-- source keys and DLCs under the user's uploaded manifest choices.
+function mp.enrich_game_import_rpc(ctx, json_str)
+  ctx = ctx or mp.default_ctx()
+  local ok, req = pcall(json.decode, json_str)
+  if not ok or type(req) ~= "table" or type(req.lua) ~= "string" then
+    return err("bad request")
+  end
+  local appid = positive_id(req.appid)
+  if not appid then return err("invalid appid") end
+  local state, serr = read_import_state(ctx, req.session)
+  if not state then return err(serr) end
+  local entries, cerr = collect_import_entries(ctx, req.session, state)
+  if not entries then return err(cerr) end
+  local has_app = false
+  for _, entry in ipairs(entries) do
+    if tostring(entry.name):lower():match("%.lua$") then
+      local parsed = mp.parse_lua(entry.data or "")
+      if parsed.base == appid then has_app = true; break end
+    end
+  end
+  if not has_app then return err("import session does not contain app " .. appid) end
+  local canonical, merr = mp.merge_lua_text(appid, req.lua)
+  if not canonical then return err(merr) end
+  state.enrichment = type(state.enrichment) == "table" and state.enrichment or {}
+  state.enrichment[tostring(appid)] = canonical
+  state.prepared = false
+  local sw, se = write_import_state(ctx, req.session, state)
+  if not sw then return err(se) end
+  return json.encode({ success = true, appid = appid })
+end
+
+function mp.prepare_game_import_rpc(ctx, json_str)
+  ctx = ctx or mp.default_ctx()
+  local ok, req = pcall(json.decode, json_str)
+  if not ok or type(req) ~= "table" then return err("bad request") end
+  local state, serr = read_import_state(ctx, req.session)
+  if not state then return err(serr) end
+  local plan, perr = build_import_plan(ctx, req.session, state)
+  if not plan then return err(perr) end
+  state.prepared = true
+  local sw, se = write_import_state(ctx, req.session, state)
+  if not sw then return err(se) end
+  local apps, manifests = {}, {}
+  for _, app in ipairs(plan.apps) do
+    local parsed, keys = mp.parse_lua(app.text), 0
+    for _, info in pairs(parsed.depots) do if info.key then keys = keys + 1 end end
+    apps[#apps + 1] = {
+      appid = app.appid, pins = app.pins, keys = keys, installed = app.installed,
+    }
+  end
+  for _, man in ipairs(plan.manifests) do
+    manifests[#manifests + 1] = {
+      depot = man.depot, gid = man.gid, date = man.creation_time,
+      name = man.name, source = man.source_name,
+    }
+  end
+  return json.encode({ success = true, apps = json.array(apps),
+    manifests = json.array(manifests), warnings = json.array(plan.warnings) })
+end
+
+-- BuildGameDraft{appid, dlc_appids, pins}: canonical data-only Lua for the
+-- simple creator. Keys are intentionally absent here; the frontend asks the
+-- existing LuaTools sources to enrich the draft before CommitGameImport.
+function mp.build_game_draft_rpc(_, json_str)
+  local ok, req = pcall(json.decode, json_str)
+  if not ok or type(req) ~= "table" then return err("bad request") end
+  local text, berr = mp.build_draft_lua(req)
+  if not text then return err(berr) end
+  return json.encode({ success = true, appid = positive_id(req.appid), lua = text })
+end
+
+local function marker_with_apps(current, apps)
+  local set = mp.parse_imports(current or "")
+  for _, app in ipairs(apps) do set[app.appid] = true end
+  local ids = sorted_numeric_keys(set)
+  local lines = {}; for _, id in ipairs(ids) do lines[#lines + 1] = tostring(id) end
+  return #lines > 0 and (table.concat(lines, "\n") .. "\n") or ""
+end
+
+local function publish_import(publications)
+  local nonce = tostring(os.time()) .. "." .. tostring(math.random(100000, 999999))
+  local snapshots, staged = {}, {}
+  for i, pub in ipairs(publications) do
+    local temp = pub.path .. ".tmp.lumen.import." .. nonce .. "." .. i
+    local f, ferr = io.open(temp, "wb")
+    if not f then for _, p in ipairs(staged) do os.remove(p) end; return false, ferr end
+    if os.execute("chmod 600 -- " .. shell_quote(temp) .. " 2>/dev/null") ~= true then
+      f:close(); os.remove(temp)
+      for _, p in ipairs(staged) do os.remove(p) end
+      return false, "could not protect staged publication"
+    end
+    local wrote, werr = f:write(pub.data); f:close()
+    if not wrote then os.remove(temp); for _, p in ipairs(staged) do os.remove(p) end; return false, werr end
+    staged[i] = temp
+    snapshots[i] = { exists = read_file(pub.path) ~= nil, data = read_file(pub.path) }
+  end
+  for i, pub in ipairs(publications) do
+    local ok, rerr = os.rename(staged[i], pub.path)
+    if not ok then
+      for j = i, #staged do os.remove(staged[j]) end
+      for j = i - 1, 1, -1 do
+        if snapshots[j].exists then write_plain_atomic(publications[j].path, snapshots[j].data)
+        else os.remove(publications[j].path) end
+      end
+      return false, rerr or "publication failed"
+    end
+  end
+  return true
+end
+
+function mp.commit_game_import_rpc(ctx, json_str)
+  ctx = ctx or mp.default_ctx()
+  local ok, req = pcall(json.decode, json_str)
+  if not ok or type(req) ~= "table" then return err("bad request") end
+  local state, serr = read_import_state(ctx, req.session)
+  if not state then return err(serr) end
+  if state.prepared ~= true then return err("import must be prepared first") end
+  local plan, perr = build_import_plan(ctx, req.session, state)
+  if not plan then return err(perr) end
+  if not mkdir_p(ctx.stplug_dir) or not mkdir_p(ctx.manifests_dir) then
+    return err("could not create destination directories")
+  end
+  local cfg = read_file(ctx.config_path)
+  if not looks_like_config(cfg) then return err("config.yaml not found or invalid") end
+  local pins = mp.parse_pins(cfg)
+  local publications = {}
+  for _, man in ipairs(plan.manifests) do
+    publications[#publications + 1] = { path = ctx.manifests_dir .. "/" .. man.name, data = man.data }
+  end
+  for _, app in ipairs(plan.apps) do
+    -- Smart source enrichment may have completed after Prepare. Read it now and
+    -- merge it first, preserving its keys while the uploaded Lua wins on pins.
+    local target = ctx.stplug_dir .. "/" .. app.appid .. ".lua"
+    local merged, merr = mp.merge_lua_text(app.appid, read_file(target) or "", app.text)
+    if not merged then return err(merr) end
+    publications[#publications + 1] = { path = target, data = merged }
+    local parsed, depot_gids = mp.parse_lua(merged), {}
+    for depot, info in pairs(parsed.depots) do
+      if info.manifestid then depot_gids[depot] = info.manifestid end
+    end
+    if next(depot_gids) then mp.set_game_pin(pins, app.appid, depot_gids)
+    else mp.clear_game_pin(pins, app.appid) end
+  end
+  publications[#publications + 1] = { path = ctx.config_path, data = mp.splice_pins(cfg, pins) }
+  if ctx.imports_path and #plan.apps > 0 then
+    publications[#publications + 1] = {
+      path = ctx.imports_path, data = marker_with_apps(read_file(ctx.imports_path), plan.apps),
+    }
+  end
+  local pok, puberr = publish_import(publications)
+  if not pok then return err(puberr) end
+  for _, app in ipairs(plan.apps) do mp.invalidate_appinfo_cache(ctx, app.appid) end
+  remove_tree(import_session_dir(ctx, req.session))
+  return json.encode({ success = true, apps = #plan.apps, manifests = #plan.manifests })
+end
+
 function mp.get_game_updates(ctx)
   ctx = ctx or mp.default_ctx()
   local ok, games = pcall(mp.build_games, ctx)
@@ -1126,6 +1903,36 @@ function mp.import_lua_pin_rpc(ctx, json_str)
 
   local pins = mp.parse_pins(read_file(ctx.config_path) or "")
   mp.set_game_pin(pins, appid, depot_gids)
+  local wok, werr = write_pins(ctx.config_path, pins)
+  if not wok then return err(werr) end
+  mp.invalidate_appinfo_cache(ctx, appid)
+  return json.encode({ success = true, appid = appid, pinned = count })
+end
+
+-- SyncGamePins{appid, lua}: synchronize ManifestPins with an edited canonical
+-- Lua. Unlike the legacy ImportLuaPin endpoint, zero setManifestid declarations
+-- are meaningful here: they clear an older lock and restore Latest behavior.
+function mp.sync_game_pins_rpc(ctx, json_str)
+  ctx = ctx or mp.default_ctx()
+  local ok, req = pcall(json.decode, json_str)
+  if not ok or type(req) ~= "table" or type(req.lua) ~= "string" then
+    return err("bad request")
+  end
+  local parsed = mp.parse_lua(req.lua)
+  local appid = positive_id(req.appid) or parsed.base
+  if not appid then return err("could not determine app id from .lua") end
+  if parsed.base and parsed.base ~= appid then
+    return err("this .lua is for app " .. parsed.base .. ", not " .. appid)
+  end
+  local depot_gids, count = {}, 0
+  for depot, info in pairs(parsed.depots) do
+    if info.manifestid then depot_gids[depot] = info.manifestid; count = count + 1 end
+  end
+  local cfg = read_file(ctx.config_path)
+  if not cfg then return err("config.yaml not found") end
+  local pins = mp.parse_pins(cfg)
+  if count > 0 then mp.set_game_pin(pins, appid, depot_gids)
+  else mp.clear_game_pin(pins, appid) end
   local wok, werr = write_pins(ctx.config_path, pins)
   if not wok then return err(werr) end
   mp.invalidate_appinfo_cache(ctx, appid)
@@ -1364,9 +2171,17 @@ function mp.register(registry)
   registry.ClearGamePin = function(j) return mp.clear_game_pin_rpc(mp.default_ctx(), j) end
   registry.ClearDlcPin = function(j) return mp.clear_dlc_pin_rpc(mp.default_ctx(), j) end
   registry.ImportLuaPin = function(j) return mp.import_lua_pin_rpc(mp.default_ctx(), j) end
+  registry.SyncGamePins = function(j) return mp.sync_game_pins_rpc(mp.default_ctx(), j) end
   registry.ImportLuaFull = function(j) return mp.import_lua_full_rpc(mp.default_ctx(), j) end
   registry.MarkLuaImport = function(j) return mp.mark_lua_import_rpc(mp.default_ctx(), j) end
   registry.InspectLua = function(j) return mp.inspect_lua_rpc(mp.default_ctx(), j) end
+  registry.BuildGameDraft = function(j) return mp.build_game_draft_rpc(mp.default_ctx(), j) end
+  registry.BeginGameImport = function(j) return mp.begin_game_import_rpc(mp.default_ctx(), j) end
+  registry.UploadGameImportChunk = function(j) return mp.upload_game_import_chunk_rpc(mp.default_ctx(), j) end
+  registry.CancelGameImport = function(j) return mp.cancel_game_import_rpc(mp.default_ctx(), j) end
+  registry.PrepareGameImport = function(j) return mp.prepare_game_import_rpc(mp.default_ctx(), j) end
+  registry.EnrichGameImport = function(j) return mp.enrich_game_import_rpc(mp.default_ctx(), j) end
+  registry.CommitGameImport = function(j) return mp.commit_game_import_rpc(mp.default_ctx(), j) end
   registry.DeleteManifest = function(j) return mp.delete_manifest_rpc(mp.default_ctx(), j) end
   registry.DeleteBuild = function(j) return mp.delete_build_rpc(mp.default_ctx(), j) end
   registry.DeleteAll = function(j) return mp.delete_all_rpc(mp.default_ctx(), j) end
