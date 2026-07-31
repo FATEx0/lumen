@@ -3,6 +3,7 @@
 "use strict";
 const fs = require("node:fs");
 const ui = fs.readFileSync("lua/menu/07-updates-tab.js", "utf8");
+const helpers = fs.readFileSync("lua/menu/06-updates-helpers.js", "utf8");
 const i18n = fs.readFileSync("lua/menu/02-i18n.js", "utf8");
 const styles = fs.readFileSync("lua/menu/03-styles.js", "utf8");
 const boot = fs.readFileSync("lua/boot.lua", "utf8");
@@ -81,6 +82,38 @@ ok(styles.includes(".lumen-builder-searchbox{position:relative")
   && /\.lumen-builder-results\{[^}]*position:absolute/.test(styles)
   && styles.includes(".lumen-virtual-key"),
   "catalog results are an anchored dropdown and virtual DLC rows have dedicated styles");
+ok(/game\.historyDepot/.test(helpers)
+  && /all\[h\]\.depot\s*===\s*game\.historyDepot/.test(helpers),
+  "main build history follows the backend-selected base depot");
+ok(/game\.metadataAvailable[\s\S]*return null/.test(helpers),
+  "known metadata never falls back to a DLC depot when no base history exists");
+ok(/d\.dlcAppid/.test(ui) && /fetchAppName\(d\.dlcAppid\)/.test(ui),
+  "Advanced resolves real DLC names from the associated AppID");
+ok(/depotLabel\(d,\s*game\)/.test(ui) && /game\.name/.test(helpers),
+  "base depot labels include the locally cached game name");
+ok(/nm\.textContent\s*=\s*game\.name\s*\|\|/.test(ui),
+  "game cards render the local appinfo name before the catalog lookup finishes");
+ok(!/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(helpers),
+  "depot labels contain no control-character separators");
+ok(ui.includes("lumen-depot-id") && styles.includes(".lumen-depot-id"),
+  "Advanced keeps the DepotID visible as secondary metadata");
+ok(/baseContent:\s*"Game content"/.test(i18n)
+  && /baseContent:\s*"Conteúdo do jogo"/.test(i18n),
+  "base-content fallback labels are localized");
+ok(/var _gameUpdatesCache\s*=\s*null/.test(ui)
+  && /function preloadGameUpdates\(/.test(ui)
+  && /if \(_gameUpdatesCache\)/.test(ui),
+  "Game Updates preloads once and reuses its in-memory result across tab switches");
+ok(/function invalidateGameUpdatesCache\(/.test(ui)
+  && /function reloadGameUpdates\(body\)\s*\{[\s\S]*invalidateGameUpdatesCache\(\)/.test(ui),
+  "explicit Game Updates mutations invalidate the preloaded result");
+ok(/renderDlcSubpage\(vers\.__bodyRef,\s*game,\s*function \(\) \{\s*renderGameUpdates\(vers\.__bodyRef\);\s*\}\)/.test(ui)
+  && !/renderDlcSubpage\(vers\.__bodyRef,\s*game,\s*function \(\) \{\s*reloadGameUpdates\(vers\.__bodyRef\);\s*\}\)/.test(ui),
+  "Advanced back reuses the loaded Game Updates snapshot without a backend reload");
+ok(/call\("DeleteAll"[\s\S]*invalidateGameUpdatesCache\(\)[\s\S]*onBack\(\)/.test(ui)
+  && /call\("ClearManifests"[\s\S]*reloadGameUpdates\(guBody\)/.test(
+    fs.readFileSync("lua/menu/09-overlay.js", "utf8")),
+  "bulk deletion cannot leave a stale preloaded game list");
 
 if (failures) process.exit(1);
 console.log("ALL PASS");

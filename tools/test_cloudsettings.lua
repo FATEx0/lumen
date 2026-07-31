@@ -384,13 +384,18 @@ do
       "presence-only API skips per-app metadata")
   end
 
-  -- The registered positional RPC wrapper must decode and forward local_appids.
+  -- The UI-facing RPC must stay on the fast presence-only path. Reading every
+  -- remote-only app's metadata makes the settings list take tens of seconds.
   local cr = require("cloudremote")
   local old_list_apps = cr.list_apps
-  local forwarded
-  cr.list_apps = function(provider, refresh_token, account, local_appids)
-    forwarded = local_appids
-    return { { appid = 311690, files = 1, size = 5423 } }
+  local old_list_appids = cr.list_appids
+  local presence_account
+  cr.list_apps = function()
+    error("UI RPC must not fetch per-app metadata")
+  end
+  cr.list_appids = function(provider, refresh_token, account)
+    presence_account = account
+    return { 250900, 311690 }
   end
   local registry = {}
   cs.register(registry, cfgp)
@@ -399,9 +404,11 @@ do
     json = json.encode({ account = 1052518393, local_appids = { 250900 } }),
   })
   cr.list_apps = old_list_apps
-  ok(dispatched, "structured remote RPC dispatch succeeds")
-  eq(forwarded[1], 250900, "registered RPC forwards local_appids")
-  eq(json.decode(raw).apps[1].size, 5423, "registered RPC returns structured stats")
+  cr.list_appids = old_list_appids
+  ok(dispatched, "presence-only remote RPC dispatch succeeds")
+  eq(presence_account, 1052518393, "registered RPC forwards the selected account")
+  eq(json.decode(raw).appids[2], 311690, "registered RPC returns remote appids")
+  ok(json.decode(raw).apps == nil, "registered RPC omits expensive remote metadata")
   os.execute("rm -rf '" .. dir .. "'")
 end
 

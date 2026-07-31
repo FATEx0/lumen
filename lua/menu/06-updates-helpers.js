@@ -82,6 +82,19 @@
   function baseDepot(game) {
     var all = game.depots || [];
     if (all.length === 0) return null;
+    // Product metadata is authoritative. The backend selects one real base
+    // content depot and excludes DLC/shared/platform siblings from the main
+    // release history. Keep the heuristic below only for older or cache-less
+    // installs that do not expose historyDepot yet.
+    if (game.historyDepot) {
+      for (var h = 0; h < all.length; h++) {
+        if (all[h].depot === game.historyDepot) return all[h];
+      }
+    }
+    // Metadata was available but no archived base depot matched it. Returning
+    // an empty timeline is safer than promoting a DLC or shared component to a
+    // game build. The heuristic remains only for legacy/cache-less installs.
+    if (game.metadataAvailable) return null;
     // 1) Workshop content (depot id == appid) holds workshop snapshots, not game
     //    builds. The backend flags it; never use it for the game's timeline.
     var nonWs = all.filter(function (d) { return !d.workshop; });
@@ -438,14 +451,27 @@
     return game.depots.some(function (d) { return !!d.installed; });
   }
 
-  // Label a depot row: known Steam tool / redistributable depots get their
-  // specific friendly name (e.g. "Windows DirectX Jun 2010 Redist"); other
-  // shared-runtime depots fall back to the generic redistributables label; a
-  // game's own content depots are just "Depot <id>". The id is always shown so
-  // it stays unambiguous.
-  function depotLabel(d) {
-    if (d.name) return d.name + " (" + d.depot + ")";
-    if (d.shared) return guStrings().sharedRuntime + " (" + d.depot + ")";
-    return guStrings().depot + " " + d.depot;
+  // Label a depot row from provisioned appinfo metadata. Known Steam tools keep
+  // their specific names; base content carries the game/platform; DLC names are
+  // resolved from their associated AppID by the renderer. DepotID stays on its
+  // own secondary line so every row remains unambiguous.
+  function depotLabel(d, game) {
+    if (d.name) return d.name;
+    if (d.shared) return guStrings().sharedRuntime;
+    var GU = guStrings();
+    var label = d.kind === "dlc" ? GU.dlcContent
+      : (d.kind === "base" ? ((game && game.name ? game.name + " — " : "") + GU.baseContent)
+        : GU.depot);
+    var platform = depotPlatformLabel(d.oslist);
+    var language = d.language ? d.language : "";
+    if (platform) label += " — " + platform;
+    if (language) label += " — " + language;
+    return label;
   }
 
+  function depotPlatformLabel(oslist) {
+    var GU = guStrings();
+    var names = { windows: GU.windowsContent, linux: GU.linuxContent, macos: GU.macosContent };
+    var values = String(oslist || "").split(",").filter(Boolean);
+    return values.map(function (value) { return names[value] || value; }).join(" / ");
+  }

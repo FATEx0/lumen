@@ -688,7 +688,10 @@ function cloudsettings.register(registry, config_path)
   registry.LumenCloudApps = function() return cloudsettings.list_apps() end
   registry.LumenCloudRemoteApps = function(j)
     local r = decode_arg(j)
-    return cloudsettings.remote_apps(cp, r.account, r.local_appids)
+    -- The settings list only needs presence to decide local/cloud/synced.
+    -- Per-app metadata turns this into dozens of provider requests, while the
+    -- folder-only path returns the complete remote set in one short flow.
+    return cloudsettings.remote_appids(cp, r.account)
   end
   return registry
 end

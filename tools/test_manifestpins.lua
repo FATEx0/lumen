@@ -396,6 +396,52 @@ do
   check(mp.tool_name(238320) == nil, "tool: a real game has no tool name")
 end
 
+-- ── 8f. local appinfo depot metadata + history-depot selection ───────────
+do
+  local pragmata = table.concat({
+    '"appinfo"', '{',
+    '  "appid" "3357650"',
+    '  "common" { "name" "PRAGMATA" "oslist" "windows" }',
+    '  "depots"', '  {',
+    '    "228989" { "config" { "oslist" "windows" } "depotfromapp" "228980" "sharedinstall" "1" }',
+    '    "3357651" { "manifests" { "public" { "gid" "1" "size" "35948407599" } } }',
+    '    "3357652" { "manifests" { "public" { "gid" "2" "size" "896136527" } } }',
+    '    "3859920" { "dlcappid" "3859920" "manifests" { "public" { "gid" "3" "size" "90058268" } } }',
+    '    "3859930" { "dlcappid" "3859930" "manifests" { "public" { "gid" "4" "size" "298857949" } } }',
+    '    "branches" { "public" { "buildid" "23443442" } }',
+    '  }',
+    '}',
+  }, "\n")
+  local meta = mp.parse_appinfo_metadata(pragmata)
+  eq(meta.name, "PRAGMATA", "appinfo: game name parsed")
+  eq(meta.depots[3357651].kind, "base", "appinfo: main content is base")
+  eq(meta.depots[3357651].oslist, "windows",
+    "appinfo: depot without config inherits the game's platform")
+  eq(meta.depots[3859930].kind, "dlc", "appinfo: DLC content classified")
+  eq(meta.depots[3859930].dlc_appid, 3859930, "appinfo: associated DLC AppID exposed")
+  eq(meta.depots[228989].kind, "shared", "appinfo: shared runtime classified")
+  eq(mp.select_history_depot(meta.depots, { [3357651] = "installed" }), 3357651,
+    "history: installed PRAGMATA base content selected")
+
+  local multiplatform = mp.parse_appinfo_metadata(table.concat({
+    '"appinfo" { "common" { "name" "Example" "oslist" "windows,linux" } "depots" {',
+    '"701" { "config" { "oslist" "windows" } "manifests" { "public" { "size" "900" } } }',
+    '"702" { "config" { "oslist" "linux" } "manifests" { "public" { "size" "800" } } }',
+    '"799" { "config" { "oslist" "macos" } "manifests" { "public" { "size" "1200" } } }',
+    '} }',
+  }, "\n"))
+  eq(mp.select_history_depot(multiplatform.depots, { [702] = "installed" }), 702,
+    "history: installed native-Linux base wins")
+  eq(mp.select_history_depot(multiplatform.depots, {}), 701,
+    "history: Windows base is the Linux/Proton fallback when not installed")
+  eq(mp.select_history_depot(multiplatform.depots, {}, { [702] = true }), 702,
+    "history: only a base depot with archived manifests can represent builds")
+  check(mp.select_history_depot(multiplatform.depots, {}, { [999] = true }) == nil,
+    "history: DLC-only or unrelated archives never become the game timeline")
+  check(mp.parse_appinfo_metadata("").available == false,
+    "appinfo: missing cache produces an explicit unavailable fallback")
+end
+
 -- ── 9. tree assembly from fixture .lua / .acf / manifests dir ──────────────
 do
   -- Build a synthetic manifest file with a given depot + creation_time.
@@ -448,6 +494,18 @@ do
   local ctx = { config_path = cfg, stplug_dir = stplug, manifests_dir = mans, steam_root = root }
   local games = mp.build_games(ctx)
   eq(#games, 1, "build: one game")
+  local manifest_scans = 0
+  local indexed_ctx = {}
+  for k, v in pairs(ctx) do indexed_ctx[k] = v end
+  indexed_ctx.list_manifest_names = function()
+    manifest_scans = manifest_scans + 1
+    return {
+      "638510_900.manifest", "638511_111.manifest", "638511_222.manifest",
+      "not-a-manifest", "638511_bad.manifest",
+    }
+  end
+  mp.build_games(indexed_ctx)
+  eq(manifest_scans, 1, "build: manifest directory is indexed once for all depots")
   local g = games[1]
   eq(g.appid, 638510, "build: appid")
   eq(#g.depots, 2, "build: two depots with archived manifests")
@@ -474,6 +532,55 @@ do
   local dlc = {}
   for _, id in ipairs(g.dlc_appids) do dlc[id] = true end
   check(dlc[999], "build: dlc appid surfaced")
+
+  -- Appinfo metadata enriches every row and identifies the single depot whose
+  -- archived manifests represent the main game timeline.
+  local cache = root .. "/cache"; mkdir(cache); ctx.cache_dir = cache
+  local metadata_cache = root .. "/lumen-cache"; mkdir(metadata_cache)
+  ctx.metadata_cache_dir = metadata_cache
+  local appinfo = assert(io.open(cache .. "/picsbuffer_638510.bin", "wb"))
+  appinfo:write(table.concat({
+    '"appinfo" { "common" { "name" "dotAGE" "oslist" "windows" } "depots" {',
+    '"638510" { "config" { "oslist" "windows" } "manifests" { "public" { "size" "10" } } }',
+    '"638511" { "config" { "oslist" "windows" } "manifests" { "public" { "size" "1000" } } }',
+    '} }',
+  }, "\n")); appinfo:close()
+  local enriched
+  for _, game in ipairs(mp.build_games(ctx)) do if game.appid == 638510 then enriched = game end end
+  eq(enriched.historyDepot, 638511, "build: backend exposes authoritative history depot")
+  eq(enriched.name, "dotAGE", "build: cached appinfo game name surfaced")
+  local enriched_by_id = {}
+  for _, dep in ipairs(enriched.depots) do enriched_by_id[dep.depot] = dep end
+  eq(enriched_by_id[638511].kind, "base", "build: content row carries base kind")
+  eq(enriched_by_id[638511].oslist, "windows", "build: content row carries platform")
+  check(io.open(metadata_cache .. "/638510.json", "rb") == nil,
+    "build cache: read-only listing does not rewrite presentation metadata")
+
+  -- Changing a pin intentionally removes picsbuffer_<appid>.bin so SLSsteam
+  -- can regenerate it. Game Updates must still retain the presentation-only
+  -- depot metadata when the tab is reopened before that regeneration.
+  os.remove(metadata_cache .. "/638510.json")
+  mp.invalidate_appinfo_cache(ctx, 638510)
+  check(io.open(cache .. "/picsbuffer_638510.bin", "rb") == nil,
+    "build cache: operational appinfo buffer was invalidated")
+  local metadata_file = io.open(metadata_cache .. "/638510.json", "rb")
+  local metadata_body = metadata_file and metadata_file:read("*a") or nil
+  if metadata_file then metadata_file:close() end
+  local metadata_json = metadata_body and json.decode(metadata_body) or nil
+  eq(metadata_json and metadata_json.version, 1,
+    "build cache: versioned presentation metadata is persisted")
+  check(metadata_body and not metadata_body:find("manifest", 1, true)
+      and not metadata_body:find("key", 1, true),
+    "build cache: sidecar contains no manifest IDs or content keys")
+  local reopened
+  for _, game in ipairs(mp.build_games(ctx)) do if game.appid == 638510 then reopened = game end end
+  eq(reopened.name, "dotAGE", "build cache: game name survives appinfo invalidation")
+  eq(reopened.historyDepot, 638511,
+    "build cache: authoritative history depot survives appinfo invalidation")
+  local reopened_by_id = {}
+  for _, dep in ipairs(reopened.depots) do reopened_by_id[dep.depot] = dep end
+  eq(reopened_by_id[638511].kind, "base",
+    "build cache: depot classification survives appinfo invalidation")
 
   -- a game whose depots have NO archived manifests is omitted (nothing to pin;
   -- avoids an empty list serializing as {} and breaking the frontend)

@@ -11,7 +11,9 @@ const menuDir = path.join(__dirname, "..", "lua", "menu");
 const core = fs.readFileSync(path.join(menuDir, "01-core.js"), "utf8");
 const cloud = fs.readFileSync(path.join(menuDir, "12-cloud-tab.js"), "utf8");
 const source = core + "\n" + cloud +
-  "\nwindow.__testCloudMerge = typeof cloudMergeApps === \"function\" ? cloudMergeApps : null;\n})();";
+  "\nwindow.__testCloudMerge = typeof cloudMergeApps === \"function\" ? cloudMergeApps : null;" +
+  "\nwindow.__testCloudAppsResolved = typeof cloudAppsResolved === \"function\" ? cloudAppsResolved : null;" +
+  "\nwindow.__testCloudRemoteSet = typeof cloudRemoteSet === \"function\" ? cloudRemoteSet : null;\n})();";
 
 const context = {
   window: {},
@@ -27,6 +29,27 @@ if (typeof merge !== "function") {
   console.error("FAIL: cloudMergeApps is not defined");
   process.exit(1);
 }
+
+const resolved = context.window.__testCloudAppsResolved;
+if (typeof resolved !== "function") {
+  console.error("FAIL: cloudAppsResolved is not defined");
+  process.exit(1);
+}
+eq(resolved(7, {}), false,
+  "selected account remains loading before its remote listing resolves");
+eq(resolved(7, { 7: {} }), true,
+  "selected account becomes renderable after an empty remote listing resolves");
+eq(resolved(null, {}), true,
+  "a local-only view does not wait for a remote account");
+
+const remoteSet = context.window.__testCloudRemoteSet;
+if (typeof remoteSet !== "function") {
+  console.error("FAIL: cloudRemoteSet is not defined");
+  process.exit(1);
+}
+const presence = remoteSet([{ appid: 311690 }, 534380]);
+eq(presence[311690].statsKnown, false,
+  "presence-only remote games mark detailed statistics as unknown");
 
 const merged = merge(
   [{ appid: 534380, account: 7, files: 2, size: 70006 }],
@@ -53,6 +76,11 @@ eq(byId[311690].local, false, "remote-only game is not local");
 eq(byId[311690].remote, true, "remote-only game is remote");
 eq(byId[311690].files, 1, "remote-only game uses remote file count");
 eq(byId[311690].size, 5423, "remote-only game uses remote byte size");
+eq(byId[311690].statsKnown, true, "structured remote stats remain displayable");
+
+const presenceOnly = merge([], presence, 7)[0];
+eq(presenceOnly.statsKnown, false,
+  "presence-only remote game never presents made-up zero statistics");
 
 if (!cloud.includes("local_appids")) {
   console.error("FAIL: remote RPC payload does not include local_appids");
@@ -60,6 +88,14 @@ if (!cloud.includes("local_appids")) {
 }
 if (!cloud.includes("r.apps")) {
   console.error("FAIL: remote RPC response does not consume structured apps");
+  process.exit(1);
+}
+if (!cloud.includes("if (!cloudAppsResolved(currentAccount, remoteSets))")) {
+  console.error("FAIL: cloud games draw does not retain loading until remote state is complete");
+  process.exit(1);
+}
+if (!cloud.includes("localStorage.getItem") || !cloud.includes("localStorage.setItem")) {
+  console.error("FAIL: remote app presence is not cached for the next settings open");
   process.exit(1);
 }
 

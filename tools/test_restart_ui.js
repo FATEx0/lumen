@@ -86,7 +86,7 @@ function tick() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-function run(restartResponse) {
+function run(restartResponse, options = {}) {
   const fragment = fs.readFileSync(
     path.join(__dirname, "..", "lua", "menu", "09-overlay.js"), "utf8");
   const root = new El("html");
@@ -94,7 +94,7 @@ function run(restartResponse) {
   root.appendChild(body);
   const calls = [];
   const confirms = [];
-  const window = { __lumenCloud: false };
+  const window = { __lumenCloud: options.cloud !== false };
   const document = {
     body,
     documentElement: root,
@@ -127,10 +127,12 @@ function run(restartResponse) {
     "function closeOverlay(){}",
     "function guStrings(){return {tab:'Game Updates',title:'Game Updates',experimental:'Experimental',experimentalHint:'',clearManifests:'Clear',clearHint:'',clearConfirm:'Confirm',clearFail:'Failed'};}",
     "function cloudStrings(){return {tab:'Cloud',title:'Cloud'};}",
-    "function renderConfig(){}",
-    "function renderGameUpdates(){}",
-    "function renderCloud(){}",
-    "function renderAbout(){}",
+    "function renderConfig(body){body.textContent='CONFIG';}",
+    "function renderGameUpdates(body){body.textContent='UPDATES LOADING';call('GetGameUpdates',{}).then(function(){body.textContent='UPDATES';});}",
+    "function reloadGameUpdates(body){renderGameUpdates(body);}",
+    "function guSetTabActive(){}",
+    "function renderCloud(body){body.textContent='CLOUD LOADING';return call('LumenCloudStatus',{}).then(function(){body.textContent='CLOUD';});}",
+    "function renderAbout(body){body.textContent='ABOUT LOADING';call('GetAboutVersions',{}).then(function(){body.textContent='ABOUT';});}",
     "function showConfirm(opts){window.__confirms.push(opts);}",
     "function call(fn,args){return window.__call(fn,args||{});}",
     fragment,
@@ -141,6 +143,15 @@ function run(restartResponse) {
     calls.push({ name, args });
     if (name === "GetSlsConfig") {
       return Promise.resolve(JSON.stringify({ success: true, schema: [], values: {} }));
+    }
+    if (name === "GetGameUpdates" && options.gameUpdatesPromise) {
+      return options.gameUpdatesPromise;
+    }
+    if (name === "LumenCloudStatus" && options.cloudPromise) {
+      return options.cloudPromise;
+    }
+    if (name === "GetAboutVersions" && options.aboutPromise) {
+      return options.aboutPromise;
     }
     if (name === "RestartSteam") {
       return Promise.resolve(JSON.stringify(
@@ -161,6 +172,17 @@ function run(restartResponse) {
 async function main() {
   {
     const { root, calls, confirms } = run();
+    await tick();
+    await tick();
+    const slsLoad = calls.findIndex((call) => call.name === "GetSlsConfig");
+    const backgroundLoads = ["GetGameUpdates", "LumenCloudStatus", "GetAboutVersions"]
+      .map((name) => calls.findIndex((call) => call.name === name));
+    if (slsLoad === -1 || backgroundLoads.some((index) => index === -1 || slsLoad > index)) {
+      throw new Error("all secondary tabs must preload only after the default tab has loaded");
+    }
+    if (!(backgroundLoads[1] < backgroundLoads[0] && backgroundLoads[1] < backgroundLoads[2])) {
+      throw new Error("Cloud Saves must preload before Game Updates and About");
+    }
     const restart = byClass(root, "lumen-restart")[0];
     const reset = byClass(root, "reset").find(
       (el) => el !== restart && el.textContent === "Reset to defaults");
@@ -195,6 +217,69 @@ async function main() {
     tabs[0].click();
     if (restart.style.display === "none") {
       throw new Error("restart returns with the slsteam-moon tab");
+    }
+    await tick();
+    for (const name of ["GetGameUpdates", "LumenCloudStatus", "GetAboutVersions"]) {
+      if (calls.filter((call) => call.name === name).length !== 1) {
+        throw new Error(`${name} preload must not restart on tab switches`);
+      }
+    }
+  }
+
+  {
+    let resolveUpdates;
+    let resolveCloud;
+    let resolveAbout;
+    const pendingUpdates = new Promise((resolve) => { resolveUpdates = resolve; });
+    const pendingCloud = new Promise((resolve) => { resolveCloud = resolve; });
+    const pendingAbout = new Promise((resolve) => { resolveAbout = resolve; });
+    const { root, calls } = run(null, {
+      gameUpdatesPromise: pendingUpdates,
+      cloudPromise: pendingCloud,
+      aboutPromise: pendingAbout,
+    });
+    await tick();
+    await tick();
+    const tabs = byClass(root, "lumen-tab");
+    const panels = Object.fromEntries(byClass(root, "lumen-tab-panel").map(
+      (panel) => [panel.id.replace("lumen-panel-", ""), panel]));
+    if (!panels.cloud.textContent.includes("LOADING")
+        || panels.gu.textContent || panels.about.textContent) {
+      throw new Error("Cloud Saves must get background preload priority");
+    }
+    for (const index of [1, 2, 3, 0, 3, 2, 1, 0]) {
+      tabs[index].click();
+      const active = ["sls", "gu", "cloud", "about"][index];
+      for (const [name, panel] of Object.entries(panels)) {
+        const visible = panel.style.display !== "none";
+        if (visible !== (name === active)) {
+          throw new Error(`only ${active} panel should be visible`);
+        }
+      }
+      if (panels.sls.textContent !== "CONFIG") {
+        throw new Error("background tab loads must never replace slsteam-moon");
+      }
+    }
+    if (!panels.gu.textContent.includes("LOADING")
+        || !panels.cloud.textContent.includes("LOADING")
+        || !panels.about.textContent.includes("LOADING")) {
+      throw new Error("clicking a pending tab must initialize it immediately");
+    }
+    if (calls.filter((call) => call.name === "GetSlsConfig").length !== 1) {
+      throw new Error("returning to slsteam-moon must reuse the loaded config");
+    }
+    for (const name of ["GetGameUpdates", "LumenCloudStatus", "GetAboutVersions"]) {
+      if (calls.filter((call) => call.name === name).length !== 1) {
+        throw new Error(`${name} must run once even when clicked during Cloud preload`);
+      }
+    }
+    resolveUpdates(JSON.stringify({ success: true, games: [] }));
+    resolveCloud(JSON.stringify({ success: true }));
+    resolveAbout(JSON.stringify({ success: true, components: [] }));
+    await tick();
+    if (panels.sls.textContent !== "CONFIG" || panels.gu.textContent !== "UPDATES"
+        || panels.cloud.textContent !== "CLOUD" || panels.about.textContent !== "ABOUT") {
+      throw new Error("late responses must update only their own persistent panel");
     }
   }
 

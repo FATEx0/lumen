@@ -54,6 +54,7 @@
     x.className = "x";
     x.textContent = "\u2715";
     x.addEventListener("click", requestClose);
+    var slsBody, guBody, cloudBody, aboutBody;
 
     // Reset-to-defaults button: header-right (slsteam-moon tab only). Two-click
     // confirm so it can't fire by accident; on success the backend returns fresh
@@ -81,14 +82,14 @@
         .then(function (res) {
           var cfg = JSON.parse(res);
           if (!cfg || !cfg.success) throw new Error((cfg && cfg.error) || "reset failed");
-          renderConfig(body, cfg);
+          renderConfig(slsBody, cfg);
         })
         .catch(function (e) {
-          body.textContent = "";
+          slsBody.textContent = "";
           var err = document.createElement("div");
           err.className = "lumen-err";
           err.textContent = (S0.resetFail || "Reset failed: ") + (e && e.message ? e.message : e);
-          body.appendChild(err);
+          slsBody.appendChild(err);
         });
     });
 
@@ -156,43 +157,84 @@
         .then(function (res) {
           var r = JSON.parse(res);
           if (!r || !r.success) throw new Error((r && r.error) || "clear failed");
-          renderGameUpdates(body);
+          reloadGameUpdates(guBody);
         })
         .catch(function (e) {
           var er = document.createElement("div");
           er.className = "lumen-err";
           er.textContent = guStrings().clearFail + (e && e.message ? e.message : e);
-          body.appendChild(er);
+          guBody.appendChild(er);
         });
     });
 
     ctop.appendChild(h); ctop.appendChild(clearBtn); ctop.appendChild(restartBtn); ctop.appendChild(resetBtn); ctop.appendChild(x);
 
-    var body = document.createElement("div");
-    body.className = "lumen-body";
-
     content.appendChild(ctop);
-    content.appendChild(body);
+    function makePanel(name) {
+      var panel = document.createElement("div");
+      panel.id = "lumen-panel-" + name;
+      panel.className = "lumen-body lumen-tab-panel";
+      panel.style.display = "none";
+      content.appendChild(panel);
+      return panel;
+    }
+    slsBody = makePanel("sls");
+    guBody = makePanel("gu");
+    cloudBody = tabCloud ? makePanel("cloud") : null;
+    aboutBody = makePanel("about");
     win.appendChild(side);
     win.appendChild(content);
     overlay.appendChild(win);
     (document.body || document.documentElement).appendChild(overlay);
 
+    // Each tab owns a persistent panel and initializes at most once. Async
+    // responses can therefore finish in the background without clearing or
+    // replacing whichever tab the user is currently viewing.
+    var initialized = { sls: false, gu: false, cloud: false, about: false };
+    var preloadStarted = false;
+
+    function preloadRemainingTabs() {
+      if (preloadStarted) return;
+      preloadStarted = true;
+      var cloudWarm = cloudBody ? ensureTab("cloud") : Promise.resolve();
+      Promise.resolve(cloudWarm).catch(function (e) { log("preload Cloud Saves", e); })
+        .then(function () {
+          ensureTab("gu");
+          ensureTab("about");
+        });
+    }
+
     function loadSlsConfig() {
-      body.textContent = "Loading\u2026";
-      call("GetSlsConfig", {})
+      slsBody.textContent = "Loading\u2026";
+      return call("GetSlsConfig", {})
         .then(function (res) {
           var config = JSON.parse(res);
           if (!config || !config.success) throw new Error((config && config.error) || "load failed");
-          renderConfig(body, config);
+          renderConfig(slsBody, config);
+          // The lightweight default panel is usable before background work is
+          // queued. All remaining panels then warm once and retain their DOM.
+          preloadRemainingTabs();
+          return config;
         })
         .catch(function (e) {
-          body.textContent = "";
+          slsBody.textContent = "";
           var err = document.createElement("div");
           err.className = "lumen-err";
           err.textContent = "Failed to load slsteam-moon config: " + (e && e.message ? e.message : e);
-          body.appendChild(err);
+          slsBody.appendChild(err);
         });
+    }
+
+    function ensureTab(which) {
+      if (initialized[which]) return initialized[which];
+      initialized[which] = true;
+      var loading;
+      if (which === "sls") loading = loadSlsConfig();
+      else if (which === "gu") loading = renderGameUpdates(guBody);
+      else if (which === "cloud" && cloudBody) loading = renderCloud(cloudBody);
+      else if (which === "about") loading = renderAbout(aboutBody);
+      initialized[which] = Promise.resolve(loading);
+      return initialized[which];
     }
 
     // Tab switching: update active state, header title, reset-button visibility,
@@ -204,6 +246,12 @@
       tabGu.classList.toggle("active", which === "gu");
       if (tabCloud) tabCloud.classList.toggle("active", which === "cloud");
       tabAbout.classList.toggle("active", which === "about");
+      guSetTabActive(which === "gu");
+      slsBody.style.display = which === "sls" ? "block" : "none";
+      guBody.style.display = which === "gu" ? "block" : "none";
+      if (cloudBody) cloudBody.style.display = which === "cloud" ? "block" : "none";
+      aboutBody.style.display = which === "about" ? "block" : "none";
+      ensureTab(which);
       if (which === "gu") {
         h.textContent = "";
         var gt = document.createElement("span");
@@ -220,26 +268,21 @@
         h.appendChild(info);
         resetBtn.style.display = "none";
         restartBtn.style.display = "none";
-        clearBtn.style.display = "";
-        renderGameUpdates(body);
       } else if (which === "cloud") {
         h.textContent = cloudStrings().title;
         resetBtn.style.display = "none";
         restartBtn.style.display = "none";
         clearBtn.style.display = "none";
-        renderCloud(body);
       } else if (which === "about") {
         h.textContent = ((I18N[pickLang()] || I18N.en).about || I18N.en.about).title;
         resetBtn.style.display = "none";
         restartBtn.style.display = "none";
         clearBtn.style.display = "none";
-        renderAbout(body);
       } else {
         h.textContent = "slsteam-moon";
         resetBtn.style.display = "";
         restartBtn.style.display = "";
         clearBtn.style.display = "none";
-        loadSlsConfig();
       }
     }
     tabSls.addEventListener("click", function () { selectTab("sls"); });

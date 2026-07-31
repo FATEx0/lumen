@@ -6,15 +6,24 @@
   // overlay fragment, 09). The advanced/Depots subpage hides it and shows its
   // own per-game "Delete all" instead; returning to the list restores it.
   var _guClearBtnRef = null;
+  var _guClearBtnWanted = true;
+  var _guTabActive = false;
   var _providersOffline = false;
   function guShowClearBtn(show) {
-    if (_guClearBtnRef) _guClearBtnRef.style.display = show ? "" : "none";
+    _guClearBtnWanted = !!show;
+    if (_guClearBtnRef) {
+      _guClearBtnRef.style.display = (_guTabActive && _guClearBtnWanted) ? "" : "none";
+    }
+  }
+  function guSetTabActive(active) {
+    _guTabActive = !!active;
+    guShowClearBtn(_guClearBtnWanted);
   }
 
-  // DLC / per-component sub-page: each of the game's depots is independently
-  // pinnable (SetDlcPin / ClearDlcPin). We can't map depot->DLC appid purely
-  // from on-disk data, so depots are labelled by id (a best-effort name lookup
-  // could be added later). master-detail: a back arrow returns to the list.
+  // Advanced per-component sub-page: each depot is independently pinnable
+  // (SetDlcPin / ClearDlcPin). Local appinfo identifies base, DLC and shared
+  // content; DLC display names are resolved through their associated AppID.
+  // Master-detail: a back arrow returns to the list.
   function renderDlcSubpage(body, game, onBack) {
     var GU = guStrings();
     body.textContent = "";
@@ -53,8 +62,17 @@
       meta.className = "lumen-game-meta";
       var name = document.createElement("div");
       name.className = "lumen-game-name";
-      name.textContent = depotLabel(d);
+      name.textContent = depotLabel(d, game);
+      if (d.dlcAppid) {
+        fetchAppName(d.dlcAppid).then(function (dlcName) {
+          if (dlcName) name.textContent = dlcName;
+        });
+      }
+      var depotId = document.createElement("div");
+      depotId.className = "lumen-depot-id";
+      depotId.textContent = "DepotID " + d.depot;
       meta.appendChild(name);
+      meta.appendChild(depotId);
       head.appendChild(meta);
       body.appendChild(head);
 
@@ -73,7 +91,11 @@
         synthetic: game.synthetic,
         onClick: function () {
           call("ClearDlcPin", { json: JSON.stringify({ appid: game.appid, depot: d.depot }) })
-            .then(function () { select(latest); if (isGameInstalled(game)) showValidatePrompt(game.appid); })
+            .then(function () {
+              invalidateGameUpdatesCache();
+              select(latest);
+              if (isGameInstalled(game)) showValidatePrompt(game.appid);
+            })
             .catch(function (e) { log("ClearDlcPin", e); });
         },
       });
@@ -94,7 +116,7 @@
             // previous selection stands.
             var applyPin = function () {
               return call("SetDlcPin", { json: JSON.stringify({ appid: game.appid, depot: d.depot, gid: v.gid }) })
-                .then(function () { select(row); })
+                .then(function () { invalidateGameUpdatesCache(); select(row); })
                 .catch(function (e) { log("SetDlcPin", e); });
             };
             if (isGameInstalled(game)) {
@@ -118,7 +140,10 @@
           del.addEventListener("click", function (e) {
             e.stopPropagation();
             call("DeleteManifest", { json: JSON.stringify({ depot: d.depot, gid: v.gid }) })
-              .then(function () { if (row.parentNode) row.remove(); })
+              .then(function () {
+                invalidateGameUpdatesCache();
+                if (row.parentNode) row.remove();
+              })
               .catch(function (er) { log("DeleteManifest", er); });
           });
           row.appendChild(del);
@@ -148,6 +173,7 @@
             .then(function (res) {
               var r = JSON.parse(res);
               if (!r || !r.success) throw new Error((r && r.error) || GU.delFail);
+              invalidateGameUpdatesCache();
               onBack();  // back to the list (the game may be gone now)
             })
             .catch(function (e) { log("DeleteAll", e); alert((e && e.message) || GU.delFail); });
@@ -192,7 +218,7 @@
     var name = document.createElement("div");
     name.className = "lumen-game-name";
     var nm = document.createElement("span");
-    nm.textContent = "App " + game.appid;
+    nm.textContent = game.name || ("App " + game.appid);
     name.appendChild(nm);
     fetchAppName(game.appid).then(function (n) { if (n) nm.textContent = n; });
     var lockBadge = document.createElement("span");
@@ -219,7 +245,7 @@
     adv.title = GU.advancedHint;
     adv.addEventListener("click", function (e) {
       e.stopPropagation();
-      renderDlcSubpage(vers.__bodyRef, game, function () { reloadGameUpdates(vers.__bodyRef); });
+      renderDlcSubpage(vers.__bodyRef, game, function () { renderGameUpdates(vers.__bodyRef); });
     });
     head.appendChild(adv);
 
@@ -244,7 +270,11 @@
       synthetic: game.synthetic,
       onClick: function () {
         call("ClearGamePin", { json: JSON.stringify({ appid: game.appid }) })
-          .then(function () { select(latest); setLocked(false); if (isGameInstalled(game)) showValidatePrompt(game.appid); })
+          .then(function () {
+            invalidateGameUpdatesCache();
+            select(latest); setLocked(false);
+            if (isGameInstalled(game)) showValidatePrompt(game.appid);
+          })
           .catch(function (e) { log("ClearGamePin", e); });
       },
     });
@@ -265,7 +295,7 @@
           // previous selection stands (no half-applied pin).
           var applyPin = function () {
             return call("SetGamePin", { json: JSON.stringify({ appid: game.appid, date: b.date }) })
-              .then(function () { select(row); setLocked(true); })
+              .then(function () { invalidateGameUpdatesCache(); select(row); setLocked(true); })
               .catch(function (e) { log("SetGamePin", e); });
           };
           if (isGameInstalled(game)) {
@@ -318,8 +348,40 @@
     return wrap;
   }
 
-  // Re-fetch + re-render the whole Game Updates list into `body`.
-  function reloadGameUpdates(body) { renderGameUpdates(body); }
+  var _gameUpdatesCache = null;
+  var _gameUpdatesPending = null;
+  var _gameUpdatesGeneration = 0;
+
+  function invalidateGameUpdatesCache() {
+    _gameUpdatesGeneration += 1;
+    _gameUpdatesCache = null;
+    _gameUpdatesPending = null;
+  }
+
+  function preloadGameUpdates() {
+    if (_gameUpdatesCache) return Promise.resolve(_gameUpdatesCache);
+    if (_gameUpdatesPending) return _gameUpdatesPending;
+    var generation = _gameUpdatesGeneration;
+    _gameUpdatesPending = call("GetGameUpdates", {}).then(function (res) {
+      var data = JSON.parse(res);
+      if (!data || !data.success) throw new Error((data && data.error) || "load failed");
+      if (generation === _gameUpdatesGeneration) {
+        _gameUpdatesCache = data;
+        _gameUpdatesPending = null;
+      }
+      return data;
+    }).catch(function (error) {
+      if (generation === _gameUpdatesGeneration) _gameUpdatesPending = null;
+      throw error;
+    });
+    return _gameUpdatesPending;
+  }
+
+  // Mutations re-fetch once; ordinary tab switches reuse the preloaded result.
+  function reloadGameUpdates(body) {
+    invalidateGameUpdatesCache();
+    renderGameUpdates(body);
+  }
 
   // ── Source drafts + robust file import ──────────────────────────────────
   function parseRpc(raw) {
@@ -532,7 +594,7 @@
             declineText: GU.restartLater, confirmText: GU.restartNow,
             onConfirm: function () { call("RestartSteam", {}).catch(function (e) { log("RestartSteam", e); }); },
           });
-          renderGameUpdates(body);
+          reloadGameUpdates(body);
         })
         .catch(function (e) {
           commit.disabled = false; commit.textContent = GU.importConfirm;
@@ -933,7 +995,7 @@
           declineText: GU.restartLater, confirmText: GU.restartNow,
           onConfirm: function () { call("RestartSteam", {}).catch(function (e) { log("RestartSteam", e); }); },
         });
-        renderGameUpdates(body);
+        reloadGameUpdates(body);
       }).catch(function (e) {
         commit.disabled = false; commit.textContent = GU.addGame;
         error.textContent = GU.addGameFail + ((e && e.message) || e);
@@ -1120,10 +1182,8 @@
     body.appendChild(listWrap);
     listWrap.textContent = "Loading\u2026";
 
-    call("GetGameUpdates", {})
-      .then(function (res) {
-        var data = JSON.parse(res);
-        if (!data || !data.success) throw new Error((data && data.error) || "load failed");
+    preloadGameUpdates()
+      .then(function (data) {
         _providersOffline = !!data.providers_offline;
         // Lua serializes an empty array as {} (an object), so coerce every list
         // back to an array before we filter/iterate, and drop games that ended

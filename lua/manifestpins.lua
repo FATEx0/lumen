@@ -894,10 +894,100 @@ function mp.default_ctx()
     stplug_dir = root and (root .. "/config/stplug-in") or nil,
     manifests_dir = (h ~= "" and (h .. "/.config/SLSsteam/manifests")) or nil,
     cache_dir = (h ~= "" and (h .. "/.config/SLSsteam/cache")) or nil,
+    metadata_cache_dir = (h ~= "" and (h .. "/.local/share/Lumen/cache/game-updates")) or nil,
     imports_path = (h ~= "" and (h .. "/.config/SLSsteam/lumen_lua_imports.txt")) or nil,
     import_root = (h ~= "" and (h .. "/.local/share/Lumen/imports")) or nil,
     steam_root = root,
   }
+end
+
+local function read_file(path)
+  if not path then return nil end
+  local f = io.open(path, "rb")
+  if not f then return nil end
+  local d = f:read("*a"); f:close()
+  return d
+end
+
+local function shell_quote(value)
+  return "'" .. tostring(value or ""):gsub("'", "'\\''") .. "'"
+end
+
+local function private_dir(path, create)
+  if not path or path == "" then return false end
+  local command = create and "mkdir -p -m 700 -- " or "chmod 700 -- "
+  if os.execute(command .. shell_quote(path) .. " 2>/dev/null") ~= true then return false end
+  -- `mkdir -p -m` does not tighten an already-existing directory.
+  return os.execute("chmod 700 -- " .. shell_quote(path) .. " 2>/dev/null") == true
+end
+
+local function write_plain_atomic(path, data)
+  local tmp = path .. ".tmp." .. tostring(os.time()) .. "." .. tostring(math.random(100000, 999999))
+  local f, ferr = io.open(tmp, "wb")
+  if not f then return false, ferr or "open failed" end
+  if os.execute("chmod 600 -- " .. shell_quote(tmp) .. " 2>/dev/null") ~= true then
+    f:close(); os.remove(tmp); return false, "could not protect temporary file"
+  end
+  local ok, werr = f:write(data); f:close()
+  if not ok then os.remove(tmp); return false, werr or "write failed" end
+  local renamed, rerr = os.rename(tmp, path)
+  if not renamed then os.remove(tmp); return false, rerr or "rename failed" end
+  return true
+end
+
+local function metadata_cache_path(ctx, appid)
+  return ctx and ctx.metadata_cache_dir and appid
+    and (ctx.metadata_cache_dir .. "/" .. tostring(appid) .. ".json") or nil
+end
+
+local function persist_appinfo_metadata(ctx, appid, metadata)
+  local path = metadata_cache_path(ctx, appid)
+  if not path or type(metadata) ~= "table" or metadata.available ~= true then return false end
+  if not private_dir(ctx.metadata_cache_dir, true) then return false end
+  local depots = {}
+  for id, info in pairs(type(metadata.depots) == "table" and metadata.depots or {}) do
+    depots[tostring(id)] = {
+      kind = info.kind,
+      dlc_appid = info.dlc_appid,
+      shared_appid = info.shared_appid,
+      oslist = info.oslist,
+      language = info.language,
+      content_size = info.content_size,
+    }
+  end
+  return write_plain_atomic(path, json.encode({
+    version = 1, name = metadata.name, oslist = metadata.oslist, depots = depots,
+  }))
+end
+
+local function read_persisted_appinfo_metadata(ctx, appid)
+  local raw = read_file(metadata_cache_path(ctx, appid))
+  if not raw then return nil end
+  local ok, cached = pcall(json.decode, raw)
+  if not ok or type(cached) ~= "table" or cached.version ~= 1
+      or type(cached.depots) ~= "table" then return nil end
+  local metadata = {
+    available = true,
+    name = type(cached.name) == "string" and cached.name or nil,
+    oslist = type(cached.oslist) == "string" and cached.oslist or "",
+    depots = {},
+  }
+  for raw_id, info in pairs(cached.depots) do
+    local id = positive_id(raw_id)
+    if id and type(info) == "table"
+        and (info.kind == "base" or info.kind == "dlc" or info.kind == "shared") then
+      metadata.depots[id] = {
+        id = id,
+        kind = info.kind,
+        dlc_appid = positive_id(info.dlc_appid),
+        shared_appid = positive_id(info.shared_appid),
+        oslist = tostring(info.oslist or ""),
+        language = tostring(info.language or ""),
+        content_size = math.max(0, tonumber(info.content_size) or 0),
+      }
+    end
+  end
+  return metadata
 end
 
 -- invalidate_appinfo_cache(ctx, appid): drop the provisioned appinfo buffers for
@@ -911,17 +1001,151 @@ function mp.invalidate_appinfo_cache(ctx, appid)
   local dir = ctx.cache_dir
   local id = math.tointeger(tonumber(appid))
   if not dir or not id then return end
+  local current = mp.parse_appinfo_metadata(read_file(dir .. "/picsbuffer_" .. id .. ".bin") or "")
+  persist_appinfo_metadata(ctx, id, current)
   for _, ext in ipairs({ "bin", "yaml" }) do
     os.remove(dir .. "/picsbuffer_" .. id .. "." .. ext)
   end
 end
 
-local function read_file(path)
-  if not path then return nil end
-  local f = io.open(path, "rb")
-  if not f then return nil end
-  local d = f:read("*a"); f:close()
-  return d
+-- The provisioned picsbuffer is local KV1 text (`"appinfo" { ... }`). Parse
+-- just enough of it to classify depots without making Game Updates depend on a
+-- network request or on Steam's indexed appinfo.vdf format.
+local function lex_vdf(text)
+  local tokens, i = {}, 1
+  text = tostring(text or "")
+  while i <= #text do
+    local ch = text:sub(i, i)
+    if ch:match("%s") then i = i + 1
+    elseif text:sub(i, i + 1) == "//" then
+      local nl = text:find("\n", i + 2, true); i = nl and (nl + 1) or (#text + 1)
+    elseif ch == "{" or ch == "}" then tokens[#tokens + 1] = ch; i = i + 1
+    elseif ch == '"' then
+      local out, escaped = {}, false
+      i = i + 1
+      while i <= #text do
+        ch = text:sub(i, i)
+        if escaped then out[#out + 1] = ch; escaped = false
+        elseif ch == "\\" then escaped = true
+        elseif ch == '"' then i = i + 1; break
+        else out[#out + 1] = ch end
+        i = i + 1
+      end
+      tokens[#tokens + 1] = table.concat(out)
+    else i = i + 1 end
+  end
+  return tokens
+end
+
+local function parse_vdf_map(tokens, pos)
+  local out = {}
+  while pos <= #tokens and tokens[pos] ~= "}" do
+    local key = tokens[pos]; pos = pos + 1
+    if tokens[pos] == "{" then out[key], pos = parse_vdf_map(tokens, pos + 1)
+    elseif tokens[pos] and tokens[pos] ~= "}" then out[key] = tokens[pos]; pos = pos + 1
+    else return out, pos end
+  end
+  return out, pos + 1
+end
+
+local function parse_vdf_root(text)
+  local tokens, root, pos = lex_vdf(text), {}, 1
+  while pos <= #tokens do
+    local key = tokens[pos]; pos = pos + 1
+    if tokens[pos] == "{" then root[key], pos = parse_vdf_map(tokens, pos + 1)
+    else pos = pos + 1 end
+  end
+  return root.appinfo or root
+end
+
+local function normalized_oslist(value)
+  local out, seen = {}, {}
+  for osname in tostring(value or ""):lower():gmatch("[^,%s]+") do
+    if osname == "win" then osname = "windows" end
+    if not seen[osname] then out[#out + 1], seen[osname] = osname, true end
+  end
+  return table.concat(out, ",")
+end
+
+-- parse_appinfo_metadata(text) -> {available,name,oslist,depots={...}}.
+-- Numeric children under `depots` are content rows; branches and scalar flags
+-- are intentionally ignored. Names are not invented: DLC rows expose their
+-- associated AppID so the frontend can resolve the catalog name it already
+-- knows how to cache.
+function mp.parse_appinfo_metadata(text)
+  if type(text) ~= "string" or text == "" then
+    return { available = false, depots = {} }
+  end
+  local body = parse_vdf_root(text)
+  local depot_nodes = type(body.depots) == "table" and body.depots or {}
+  local out = {
+    available = next(body) ~= nil,
+    name = type(body.common) == "table" and body.common.name or nil,
+    oslist = type(body.common) == "table" and normalized_oslist(body.common.oslist) or "",
+    depots = {},
+  }
+  local common_oslist = out.oslist
+  for key, node in pairs(depot_nodes) do
+    local id = positive_id(key)
+    if id and type(node) == "table" then
+      local config = type(node.config) == "table" and node.config or {}
+      local public = type(node.manifests) == "table"
+        and type(node.manifests.public) == "table" and node.manifests.public or {}
+      local dlc_appid = positive_id(node.dlcappid)
+      local shared_appid = positive_id(node.depotfromapp)
+      local kind = (node.sharedinstall == "1" or shared_appid) and "shared"
+        or (dlc_appid and "dlc" or "base")
+      out.depots[id] = {
+        id = id, kind = kind, dlc_appid = dlc_appid,
+        shared_appid = shared_appid,
+        oslist = normalized_oslist(config.oslist) ~= ""
+          and normalized_oslist(config.oslist) or common_oslist,
+        language = tostring(config.language or ""),
+        content_size = tonumber(public.size) or 0,
+      }
+    end
+  end
+  return out
+end
+
+
+local function load_appinfo_metadata(ctx, appid)
+  local live = mp.parse_appinfo_metadata(read_file(
+    ctx.cache_dir and (ctx.cache_dir .. "/picsbuffer_" .. appid .. ".bin") or nil) or "")
+  if live.available then return live end
+  return read_persisted_appinfo_metadata(ctx, appid) or live
+end
+
+local function supports_os(info, wanted)
+  local oslist = tostring(info and info.oslist or "")
+  if oslist == "" then return true end
+  for item in oslist:gmatch("[^,]+") do if item == wanted then return true end end
+  return false
+end
+
+-- The main timeline needs one release-bearing BASE depot. Installed content is
+-- strongest evidence because it reflects Steam's actual OS choice. Before the
+-- game is installed, Windows is preferred on Linux (Proton); native Linux is
+-- the second choice. DLC/shared/macOS-only rows never create top-level builds.
+function mp.select_history_depot(metadata, installed, available)
+  local base = {}
+  for id, info in pairs(metadata or {}) do
+    if info.kind == "base" and (available == nil or available[id]) then
+      base[#base + 1] = { id = id, info = info }
+    end
+  end
+  if #base == 0 then return nil end
+  table.sort(base, function(a, b)
+    local ai, bi = installed and installed[a.id] ~= nil, installed and installed[b.id] ~= nil
+    if ai ~= bi then return ai end
+    local aw, bw = supports_os(a.info, "windows"), supports_os(b.info, "windows")
+    if aw ~= bw then return aw end
+    local al, bl = supports_os(a.info, "linux"), supports_os(b.info, "linux")
+    if al ~= bl then return al end
+    if a.info.content_size ~= b.info.content_size then return a.info.content_size > b.info.content_size end
+    return a.id < b.id
+  end)
+  return base[1].id
 end
 
 -- read_imports(path) -> set of appids marked as "added via Load .lua".
@@ -1104,10 +1328,10 @@ end
 
 -- Currently-installed gid per depot for an app, from appmanifest_<appid>.acf.
 -- Searches every Steam library folder (the game may be on a second drive).
-local function installed_gids(steam_root, appid)
+local function installed_gids(steam_root, appid, roots)
   local out = {}
   local acf
-  for _, root in ipairs(library_roots(steam_root)) do
+  for _, root in ipairs(roots or library_roots(steam_root)) do
     acf = read_file(root .. "/steamapps/appmanifest_" .. appid .. ".acf")
     if acf then break end
   end
@@ -1124,39 +1348,43 @@ end
 
 -- Does this app have Workshop content on disk? Presence of the app's
 -- appworkshop_<appid>.acf (in any library's steamapps/workshop) is the signal.
-local function app_has_workshop(steam_root, appid)
-  for _, root in ipairs(library_roots(steam_root)) do
+local function app_has_workshop(steam_root, appid, roots)
+  for _, root in ipairs(roots or library_roots(steam_root)) do
     local f = io.open(root .. "/steamapps/workshop/appworkshop_" .. appid .. ".acf", "rb")
     if f then f:close(); return true end
   end
   return false
 end
 
--- Archived versions for a depot: scan manifests_dir for <depot>_<gid>.manifest.
-local function archived_versions(manifests_dir, depot)
+-- Group archived manifest filenames by depot. build_games creates this index
+-- once so a directory with thousands of files is not traversed again for every
+-- depot in every game.
+function mp.index_manifest_names(names)
+  local by_depot = {}
+  for _, name in ipairs(names or {}) do
+    local depot, gid = name:match("^(%d+)_(%d+)%.manifest$")
+    depot = depot and math.tointeger(tonumber(depot)) or nil
+    if depot and gid then
+      local entries = by_depot[depot]
+      if not entries then entries = {}; by_depot[depot] = entries end
+      entries[#entries + 1] = { name = name, gid = gid }
+    end
+  end
+  return by_depot
+end
+
+-- Read archived versions only for one requested depot. Directory enumeration
+-- is supplied by the one-pass index above; manifest bytes stay lazy so files
+-- belonging to unrelated games are never opened.
+local function archived_versions(manifests_dir, depot, manifest_index)
   local versions = {}
   if not manifests_dir then return versions end
-  -- list dir via lfs if available, else a shell fallback (host tests have lfs).
-  local names = {}
-  local ok_lfs, lfs = pcall(require, "lfs")
-  if ok_lfs then
-    -- lfs.dir throws if manifests_dir doesn't exist yet (fresh install, nothing
-    -- archived). Guard so a depot with no archived versions just returns {}.
-    pcall(function()
-      for entry in lfs.dir(manifests_dir) do names[#names + 1] = entry end
-    end)
-  else
-    local p = io.popen("ls -1 '" .. manifests_dir .. "' 2>/dev/null")
-    if p then for line in p:lines() do names[#names + 1] = line end; p:close() end
-  end
-  local prefix = depot .. "_"
-  for _, name in ipairs(names) do
-    local gid = name:match("^" .. depot .. "_(%d+)%.manifest$")
-    if gid then
-      local bytes = read_file(manifests_dir .. "/" .. name)
-      local ct = bytes and mp.creation_time_from_bytes(bytes) or nil
-      versions[#versions + 1] = { gid = gid, date = ct or 0, size = bytes and #bytes or 0 }
-    end
+  for _, entry in ipairs((manifest_index and manifest_index[depot]) or {}) do
+    local bytes = read_file(manifests_dir .. "/" .. entry.name)
+    local ct = bytes and mp.creation_time_from_bytes(bytes) or nil
+    versions[#versions + 1] = {
+      gid = entry.gid, date = ct or 0, size = bytes and #bytes or 0,
+    }
   end
   return versions
 end
@@ -1167,6 +1395,10 @@ function mp.build_games(ctx)
   ctx = ctx or mp.default_ctx()
   local pins = mp.parse_pins(read_file(ctx.config_path) or "")
   local imports = read_imports(ctx.imports_path)
+  local roots = library_roots(ctx.steam_root)
+  local manifest_names = ctx.list_manifest_names
+    and ctx.list_manifest_names(ctx.manifests_dir) or list_dir(ctx.manifests_dir)
+  local manifest_index = mp.index_manifest_names(manifest_names)
 
   -- enumerate <appid>.lua in stplug-in
   local lua_files = {}
@@ -1199,13 +1431,14 @@ function mp.build_games(ctx)
     if appid and not mp.is_tool(appid) then
       local lua = read_file(ctx.stplug_dir .. "/" .. name) or ""
       local parsed = mp.parse_lua(lua)
-      local installed = installed_gids(ctx.steam_root, appid)
+      local installed = installed_gids(ctx.steam_root, appid, roots)
+      local appinfo = load_appinfo_metadata(ctx, appid)
       local appPins = pins[appid] or { locked = false, depots = {} }
-      local has_workshop = app_has_workshop(ctx.steam_root, appid)
+      local has_workshop = app_has_workshop(ctx.steam_root, appid, roots)
 
       local depots = {}
       for depot, info in pairs(parsed.depots) do
-        local versions = archived_versions(ctx.manifests_dir, depot)
+        local versions = archived_versions(ctx.manifests_dir, depot, manifest_index)
         if #versions > 0 then
           for _, v in ipairs(versions) do
             v.fromLuaTools = (info.manifestid ~= nil and v.gid == info.manifestid)
@@ -1216,6 +1449,10 @@ function mp.build_games(ctx)
           depots[#depots + 1] = {
             depot = depot,
             name = mp.tool_name(depot),
+            kind = appinfo.depots[depot] and appinfo.depots[depot].kind or nil,
+            dlcAppid = appinfo.depots[depot] and appinfo.depots[depot].dlc_appid or nil,
+            oslist = appinfo.depots[depot] and appinfo.depots[depot].oslist or "",
+            language = appinfo.depots[depot] and appinfo.depots[depot].language or "",
             fromLuaTools = info.manifestid,
             installed = installed[depot],
             workshop = mp.is_workshop_depot(appid, depot, has_workshop),
@@ -1241,6 +1478,8 @@ function mp.build_games(ctx)
       -- pin, and an empty depot list would serialize as `{}` (not `[]`) and trip
       -- the frontend. (Also keeps the list clean after a manifest purge.)
       if #depots > 0 and not all_shared then
+        local available_depots = {}
+        for _, depot in ipairs(depots) do available_depots[depot.depot] = true end
         local is_synthetic = false
         if appid and ctx.cache_dir then
           local sf = io.open(ctx.cache_dir .. "/synthetic_" .. appid, "r")
@@ -1252,6 +1491,9 @@ function mp.build_games(ctx)
 
         games[#games + 1] = {
           appid = appid,
+          name = appinfo.name,
+          historyDepot = mp.select_history_depot(appinfo.depots, installed, available_depots),
+          metadataAvailable = appinfo.available,
           locked = appPins.locked or false,
           offline = is_game_offline(appid),
           depots = depots,
@@ -1360,21 +1602,9 @@ local IMPORT_MAX_TOTAL = 512 * 1024 * 1024
 local IMPORT_MAX_CHUNK = 256 * 1024
 local IMPORT_MAX_ENTRIES = 512
 
-local function shell_quote(value)
-  return "'" .. tostring(value or ""):gsub("'", "'\\''") .. "'"
-end
-
 local function mkdir_p(path)
   if not path or path == "" then return false end
   return os.execute("mkdir -p -- " .. shell_quote(path) .. " 2>/dev/null") == true
-end
-
-local function private_dir(path, create)
-  if not path or path == "" then return false end
-  local command = create and "mkdir -p -m 700 -- " or "chmod 700 -- "
-  if os.execute(command .. shell_quote(path) .. " 2>/dev/null") ~= true then return false end
-  -- `mkdir -p -m` does not tighten an already-existing directory.
-  return os.execute("chmod 700 -- " .. shell_quote(path) .. " 2>/dev/null") == true
 end
 
 local function import_session_dir(ctx, session)
@@ -1386,20 +1616,6 @@ end
 local function import_state_path(ctx, session)
   local dir = import_session_dir(ctx, session)
   return dir and (dir .. "/state.json") or nil
-end
-
-local function write_plain_atomic(path, data)
-  local tmp = path .. ".tmp." .. tostring(os.time()) .. "." .. tostring(math.random(100000, 999999))
-  local f, ferr = io.open(tmp, "wb")
-  if not f then return false, ferr or "open failed" end
-  if os.execute("chmod 600 -- " .. shell_quote(tmp) .. " 2>/dev/null") ~= true then
-    f:close(); os.remove(tmp); return false, "could not protect temporary file"
-  end
-  local ok, werr = f:write(data); f:close()
-  if not ok then os.remove(tmp); return false, werr or "write failed" end
-  local renamed, rerr = os.rename(tmp, path)
-  if not renamed then os.remove(tmp); return false, rerr or "rename failed" end
-  return true
 end
 
 local function read_import_state(ctx, session)

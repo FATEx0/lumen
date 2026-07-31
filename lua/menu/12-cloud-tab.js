@@ -155,7 +155,7 @@
     }
 
     // ── games list (one card per game with cloud-save data) ──────────────
-    cloudRenderAppsSection(body, S);
+    return cloudRenderAppsSection(body, S, status);
   }
 
   function cloudFormatSize(bytes) {
@@ -209,8 +209,11 @@
     nm.textContent = "App " + app.appid; // replaced by the store name below
     var sub = document.createElement("div");
     sub.className = "lumen-game-sub";
-    sub.textContent = "ID: " + app.appid + " \u2022 " + (app.files || 0) + " " +
-      S.appsFiles + " \u2022 " + cloudFormatSize(app.size);
+    sub.textContent = "ID: " + app.appid;
+    if (app.statsKnown !== false) {
+      sub.textContent += " \u2022 " + (app.files || 0) + " " + S.appsFiles
+        + " \u2022 " + cloudFormatSize(app.size);
+    }
     meta.appendChild(nm); meta.appendChild(sub);
 
     head.appendChild(cap); head.appendChild(meta);
@@ -239,6 +242,7 @@
         account: a.account,
         files: a.files,
         size: a.size,
+        statsKnown: true,
         local: true,
         remote: !!(remoteSet && remoteSet[a.appid]),
       };
@@ -248,11 +252,14 @@
         var id = Number(idStr);
         if (!localIds[id]) {
           var remote = remoteSet[idStr] || {};
+          var statsKnown = remote.statsKnown === true
+            || remote.files != null || remote.size != null;
           out.push({
             appid: id,
             account: account,
-            files: Number(remote.files) || 0,
-            size: Number(remote.size) || 0,
+            files: statsKnown ? (Number(remote.files) || 0) : null,
+            size: statsKnown ? (Number(remote.size) || 0) : null,
+            statsKnown: statsKnown,
             local: false,
             remote: true,
           });
@@ -262,10 +269,53 @@
     return out;
   }
 
+  function cloudAppsResolved(account, remoteSets) {
+    return account == null || remoteSets[account] !== undefined;
+  }
+
+  function cloudRemoteSet(records) {
+    var set = {};
+    (Array.isArray(records) ? records : []).forEach(function (record) {
+      var item = typeof record === "object" && record !== null ? record : { appid: record };
+      var id = Number(item.appid);
+      if (!id) return;
+      var statsKnown = item.files != null || item.size != null;
+      set[id] = {
+        appid: id,
+        files: statsKnown ? (Number(item.files) || 0) : null,
+        size: statsKnown ? (Number(item.size) || 0) : null,
+        statsKnown: statsKnown,
+      };
+    });
+    return set;
+  }
+
+  function cloudRemoteCacheKey(provider, account) {
+    return "lumen-cloud-apps-v1:" + String(provider || "local") + ":" + String(account || "none");
+  }
+
+  function cloudReadRemoteCache(provider, account) {
+    if (provider === "local" || account == null) return null;
+    try {
+      var cached = JSON.parse(localStorage.getItem(cloudRemoteCacheKey(provider, account)) || "null");
+      if (!cached || !Array.isArray(cached.appids)) return null;
+      return cloudRemoteSet(cached.appids);
+    } catch (e) { return null; }
+  }
+
+  function cloudWriteRemoteCache(provider, account, remoteSet) {
+    if (provider === "local" || account == null) return;
+    try {
+      localStorage.setItem(cloudRemoteCacheKey(provider, account), JSON.stringify({
+        savedAt: Date.now(), appids: Object.keys(remoteSet || {}).map(Number),
+      }));
+    } catch (e) {}
+  }
+
   // Render the games list into its own section under the settings. Fetches the
   // unified app list (LumenCloudApps), with a search box that filters by name or
   // app id. Kept in a dedicated container so a re-render doesn't touch the rest.
-  function cloudRenderAppsSection(body, S) {
+  function cloudRenderAppsSection(body, S, status) {
     var title = document.createElement("div");
     title.className = "lumen-sub-title";
     title.style.marginTop = "24px";
@@ -303,7 +353,11 @@
     var allApps = [];          // local apps (per Steam account)
     var nameCache = {};
     var remoteSets = {};       // account id -> { appid: {appid,files,size} }
+    var remotePending = {};
     var currentAccount = null; // selected account id (null = show all)
+    var provider = status && status.provider || "local";
+    var remoteEnabled = (provider === "gdrive" || provider === "onedrive")
+      && status && status.authenticated === true;
 
     // Build the merged view for the current account: local apps annotated with
     // whether they also exist remotely, plus remote-only games as extra cards.
@@ -316,9 +370,14 @@
     function draw() {
       var q = (search.value || "").trim().toLowerCase();
       // Remote state for the selected account is "resolved" once its fetch has
-      // completed (remoteSets[account] set, even to an empty set). Until then the
-      // cards show a spinner instead of a premature location badge.
-      var resolved = currentAccount != null && remoteSets[currentAccount] !== undefined;
+      // completed (remoteSets[account] set, even to an empty set). Keep the
+      // section's loading state until then so the user sees one complete,
+      // stable list instead of one local card followed by a remote-list jump.
+      if (!cloudAppsResolved(currentAccount, remoteSets)) {
+        list.textContent = S.appsLoading;
+        return;
+      }
+      var resolved = true;
       list.textContent = "";
       var shown = mergedApps().filter(function (a) {
         // Hide empty local-only entries (an app folder CloudRedirect created but
@@ -344,47 +403,62 @@
 
     // Fetch remote appids for an account once (cached), then redraw. Failures
     // (not signed in / offline) are non-fatal: the list just stays local-only.
-    function ensureRemote(account) {
-      if (account == null || remoteSets[account]) { draw(); return; }
+    function ensureRemote(account, refresh) {
+      if (account == null) { draw(); return Promise.resolve(); }
+      if (!remoteEnabled) {
+        remoteSets[account] = {};
+        draw();
+        return Promise.resolve(remoteSets[account]);
+      }
+      if (remotePending[account]) return remotePending[account];
+      if (remoteSets[account] && !refresh) { draw(); return Promise.resolve(remoteSets[account]); }
       var localAppids = allApps
         .filter(function (a) { return a.account === account; })
         .map(function (a) { return a.appid; });
-      call("LumenCloudRemoteApps", {
+      remotePending[account] = call("LumenCloudRemoteApps", {
         json: JSON.stringify({ account: account, local_appids: localAppids }),
       })
         .then(function (res) {
           var r; try { r = JSON.parse(res); } catch (e) {}
-          var set = {};
+          if (!r || !r.success) throw new Error((r && r.error) || "remote list failed");
           var records = [];
-          if (r && r.success && Array.isArray(r.apps)) {
+          if (Array.isArray(r.apps)) {
             records = r.apps;
-          } else if (r && r.success && Array.isArray(r.appids)) {
-            records = r.appids.map(function (id) { return { appid: id, files: 0, size: 0 }; });
+          } else if (Array.isArray(r.appids)) {
+            records = r.appids;
           }
-          records.forEach(function (app) {
-            var id = Number(app.appid);
-            if (id) set[id] = { appid: id, files: app.files || 0, size: app.size || 0 };
-          });
+          var set = cloudRemoteSet(records);
           remoteSets[account] = set;
-          if (r && r.success && typeof fetchAppName === "function") {
-            records.forEach(function (app) {
-              var id = Number(app.appid);
+          cloudWriteRemoteCache(provider, account, set);
+          if (typeof fetchAppName === "function") {
+            Object.keys(set).forEach(function (rawId) {
+              var id = Number(rawId);
               fetchAppName(id).then(function (n) { if (n) nameCache[id] = n; }).catch(function () {});
             });
           }
           draw();
+          return set;
         })
-        .catch(function () { remoteSets[account] = {}; draw(); });
+        .catch(function () {
+          if (!remoteSets[account]) remoteSets[account] = {};
+          draw();
+          return remoteSets[account];
+        })
+        .then(function (set) { remotePending[account] = null; return set; });
+      return remotePending[account];
     }
 
     search.addEventListener("input", draw);
     acctSel.addEventListener("change", function () {
       currentAccount = Number(acctSel.value);
+      if (!remoteSets[currentAccount]) {
+        remoteSets[currentAccount] = cloudReadRemoteCache(provider, currentAccount);
+      }
       draw();
-      ensureRemote(currentAccount);
+      ensureRemote(currentAccount, true);
     });
 
-    call("LumenCloudApps", {})
+    return call("LumenCloudApps", {})
       .then(function (res) {
         var r; try { r = JSON.parse(res); } catch (e) {}
         if (!r || !r.success) throw new Error((r && r.error) || "load failed");
@@ -401,13 +475,16 @@
           acctSel.value = String(currentAccount);
           acctRow.style.display = "";
         }
-        draw();                 // local first (instant)
-        ensureRemote(currentAccount); // then annotate/add remote (async)
+        if (currentAccount != null && remoteEnabled) {
+          remoteSets[currentAccount] = cloudReadRemoteCache(provider, currentAccount);
+        }
+        draw();
         if (typeof fetchAppName === "function") {
           allApps.forEach(function (a) {
             fetchAppName(a.appid).then(function (n) { if (n) nameCache[a.appid] = n; }).catch(function () {});
           });
         }
+        return ensureRemote(currentAccount, true);
       })
       .catch(function (e) {
         list.textContent = "";
@@ -482,16 +559,16 @@
   function cloudReload(body) {
     var S = cloudStrings();
     cloudStopAuthPoll();
-    call("LumenCloudStatus", {})
+    return call("LumenCloudStatus", {})
       .then(function (res) {
         var status; try { status = JSON.parse(res); } catch (e) {}
         if (!status || !status.success) throw new Error((status && status.error) || "load failed");
-        cloudRender(body, S, status);
+        return cloudRender(body, S, status);
       })
       .catch(function (e) { cloudShowError(body, S.loadFail + (e && e.message ? e.message : e)); });
   }
 
   function renderCloud(body) {
     body.textContent = "Loading\u2026";
-    cloudReload(body);
+    return cloudReload(body);
   }
