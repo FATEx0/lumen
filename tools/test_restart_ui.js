@@ -130,6 +130,7 @@ function run(restartResponse, options = {}) {
     "function renderConfig(body){body.textContent='CONFIG';}",
     "function renderGameUpdates(body){body.textContent='UPDATES LOADING';call('GetGameUpdates',{}).then(function(){body.textContent='UPDATES';});}",
     "function reloadGameUpdates(body){renderGameUpdates(body);}",
+    "function revalidateGameUpdates(){window.__revalidations.push(1);}",
     "function guSetTabActive(){}",
     "function renderCloud(body){body.textContent='CLOUD LOADING';return call('LumenCloudStatus',{}).then(function(){body.textContent='CLOUD';});}",
     "function renderAbout(body){body.textContent='ABOUT LOADING';call('GetAboutVersions',{}).then(function(){body.textContent='ABOUT';});}",
@@ -139,6 +140,8 @@ function run(restartResponse, options = {}) {
     "})();",
   ].join("\n");
   window.__confirms = confirms;
+  const revalidations = [];
+  window.__revalidations = revalidations;
   window.__call = (name, args) => {
     calls.push({ name, args });
     if (name === "GetSlsConfig") {
@@ -166,12 +169,12 @@ function run(restartResponse, options = {}) {
     clearTimeout() {},
   }, { filename: "restart-overlay.js" });
   window.__lumenOpenOverlay();
-  return { root, calls, confirms };
+  return { root, calls, confirms, revalidations };
 }
 
 async function main() {
   {
-    const { root, calls, confirms } = run();
+    const { root, calls, confirms, revalidations } = run();
     await tick();
     await tick();
     const slsLoad = calls.findIndex((call) => call.name === "GetSlsConfig");
@@ -223,6 +226,20 @@ async function main() {
       if (calls.filter((call) => call.name === name).length !== 1) {
         throw new Error(`${name} preload must not restart on tab switches`);
       }
+    }
+
+    // The persistent panel keeps its DOM, so a warm Game Updates tab is instant;
+    // it still has to confirm the list against disk, otherwise a game added
+    // outside the overlay never shows up.
+    if (revalidations.length !== 0) {
+      throw new Error("the first Game Updates load must not revalidate on top of itself");
+    }
+    tabs[1].click();
+    if (revalidations.length !== 1) {
+      throw new Error("returning to a warm Game Updates tab must revalidate its list");
+    }
+    if (calls.filter((call) => call.name === "GetGameUpdates").length !== 1) {
+      throw new Error("revalidating must not re-render the Game Updates panel");
     }
   }
 

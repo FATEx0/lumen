@@ -109,7 +109,19 @@ ok(/function invalidateGameUpdatesCache\(/.test(ui)
   "explicit Game Updates mutations invalidate the preloaded result");
 ok(/renderDlcSubpage\(vers\.__bodyRef,\s*game,\s*function \(\) \{\s*renderGameUpdates\(vers\.__bodyRef\);\s*\}\)/.test(ui)
   && !/renderDlcSubpage\(vers\.__bodyRef,\s*game,\s*function \(\) \{\s*reloadGameUpdates\(vers\.__bodyRef\);\s*\}\)/.test(ui),
-  "Advanced back reuses the loaded Game Updates snapshot without a backend reload");
+  "Advanced back repaints the loaded snapshot instead of showing a loading state");
+ok(/function revalidateGameUpdates\(/.test(ui)
+  && /function gameUpdatesSignature\(/.test(ui)
+  && /if \(_gameUpdatesCache\) \{[\s\S]*paint\(_gameUpdatesCache\);\s*revalidateGameUpdates\(\);/.test(ui),
+  "a reused snapshot is confirmed against the backend right after it is painted");
+ok(/gameUpdatesSignature\(normalizeGameUpdatesData\(data\)\) === _gameUpdatesRendered/.test(ui),
+  "an unchanged list is never repainted under the user");
+ok((ui.match(/guOwnList\(null\);/g) || []).length === 4
+  && /guOwnList\(body\);/.test(ui),
+  "every subpage releases the list so a late revalidation cannot replace it");
+ok(/var warm = !!initialized\[which\];[\s\S]*if \(which === "gu" && warm\) revalidateGameUpdates\(\);/
+  .test(fs.readFileSync("lua/menu/09-overlay.js", "utf8")),
+  "returning to a warm Game Updates tab revalidates its list in the background");
 ok(/call\("DeleteAll"[\s\S]*invalidateGameUpdatesCache\(\)[\s\S]*onBack\(\)/.test(ui)
   && /call\("ClearManifests"[\s\S]*reloadGameUpdates\(guBody\)/.test(
     fs.readFileSync("lua/menu/09-overlay.js", "utf8")),

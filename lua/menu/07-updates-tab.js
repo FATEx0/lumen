@@ -30,6 +30,7 @@
     // The per-game "Delete all" lives here; hide the header's global clear
     // button while in this subpage so the two don't compete.
     guShowClearBtn(false);
+    guOwnList(null);
     var back = document.createElement("div");
     back.className = "lumen-back";
     back.innerHTML = "\u2190 ";
@@ -351,6 +352,15 @@
   var _gameUpdatesCache = null;
   var _gameUpdatesPending = null;
   var _gameUpdatesGeneration = 0;
+  // Signature of the payload the list DOM was last built from, so a background
+  // revalidation only repaints when the data really changed.
+  var _gameUpdatesRendered = null;
+  // Panel currently showing the game list, and its painter. Subpages (Advanced,
+  // the creator, the import review) take the panel over and release it, so a
+  // revalidation that lands late can tell whether repainting the list would wipe
+  // out the view the user is actually looking at.
+  var _guListBody = null;
+  function guOwnList(body) { _guListBody = body || null; }
 
   function invalidateGameUpdatesCache() {
     _gameUpdatesGeneration += 1;
@@ -358,23 +368,90 @@
     _gameUpdatesPending = null;
   }
 
-  function preloadGameUpdates() {
-    if (_gameUpdatesCache) return Promise.resolve(_gameUpdatesCache);
+  // Always asks the backend and refreshes the snapshot. Concurrent callers share
+  // the in-flight request; a result whose generation was invalidated meanwhile
+  // (an explicit mutation) drops itself instead of restoring stale data.
+  function fetchGameUpdates() {
     if (_gameUpdatesPending) return _gameUpdatesPending;
     var generation = _gameUpdatesGeneration;
-    _gameUpdatesPending = call("GetGameUpdates", {}).then(function (res) {
+    var pending = call("GetGameUpdates", {}).then(function (res) {
       var data = JSON.parse(res);
       if (!data || !data.success) throw new Error((data && data.error) || "load failed");
       if (generation === _gameUpdatesGeneration) {
         _gameUpdatesCache = data;
-        _gameUpdatesPending = null;
+        if (_gameUpdatesPending === pending) _gameUpdatesPending = null;
       }
       return data;
     }).catch(function (error) {
-      if (generation === _gameUpdatesGeneration) _gameUpdatesPending = null;
+      if (generation === _gameUpdatesGeneration && _gameUpdatesPending === pending) {
+        _gameUpdatesPending = null;
+      }
       throw error;
     });
-    return _gameUpdatesPending;
+    _gameUpdatesPending = pending;
+    return pending;
+  }
+
+  function preloadGameUpdates() {
+    if (_gameUpdatesCache) return Promise.resolve(_gameUpdatesCache);
+    return fetchGameUpdates();
+  }
+
+  // Canonicalize the backend payload before fingerprinting it. The list renderer
+  // consumes fields at both game/depot/version levels (including metadata used
+  // by gameBuilds), so a hand-picked signature can silently miss a visible
+  // change such as fromLuaFile, installation state, or a version date. Sorting
+  // object keys keeps the fingerprint stable without relying on JSON key order.
+  function stableGameUpdatesValue(value) {
+    if (Array.isArray(value)) return value.map(stableGameUpdatesValue);
+    if (value && typeof value === "object") {
+      var sorted = {};
+      Object.keys(value).sort().forEach(function (key) {
+        sorted[key] = stableGameUpdatesValue(value[key]);
+      });
+      return sorted;
+    }
+    return value;
+  }
+  function gameUpdatesSignature(data) {
+    var games = data && Array.isArray(data.games) ? data.games : [];
+    return JSON.stringify(stableGameUpdatesValue({
+      providers_offline: !!(data && data.providers_offline),
+      games: games,
+    }));
+  }
+  // Keep cache comparison and DOM rendering on the same representation. The
+  // backend's cjson output may encode an empty Lua array as {}, while the list
+  // renderer treats that value as an empty array.
+  function normalizeGameUpdatesData(data) {
+    var arr = function (x) { return Array.isArray(x) ? x : []; };
+    var games = arr(data && data.games).filter(function (g) {
+      g.depots = arr(g.depots);
+      g.dlc_appids = arr(g.dlc_appids);
+      g.depots.forEach(function (d) { d.versions = arr(d.versions); });
+      return g.depots.length > 0;
+    });
+    return { providers_offline: !!(data && data.providers_offline), games: games };
+  }
+
+  // Games can be added from outside this panel — the LuaTools store page, the
+  // library Fixes menu, or the same script running in another Steam view, each
+  // with its own snapshot. The overlay DOM is rebuilt on every open while the
+  // snapshot lives as long as the injected script, so reusing it unconditionally
+  // can show a library that is minutes old. Whenever the list is (re)shown it is
+  // therefore painted from the snapshot for an instant view and confirmed
+  // against disk right after, replacing the list only if something changed.
+  function revalidateGameUpdates() {
+    if (!_guListBody) return Promise.resolve();
+    var generation = _gameUpdatesGeneration;
+    return fetchGameUpdates().then(function (data) {
+      // A mutation invalidated the snapshot while this was in flight, and has
+      // already repainted with authoritative data. This answer predates it.
+      if (generation !== _gameUpdatesGeneration) return;
+      if (gameUpdatesSignature(normalizeGameUpdatesData(data)) === _gameUpdatesRendered) return;
+      var body = _guListBody;
+      if (body && typeof body.__guPaint === "function") body.__guPaint(data);
+    }).catch(function (e) { log("revalidate Game Updates", e); });
   }
 
   // Mutations re-fetch once; ordinary tab switches reuse the preloaded result.
@@ -514,6 +591,7 @@
     var GU = guStrings();
     body.textContent = "";
     guShowClearBtn(false);
+    guOwnList(null);
     var back = document.createElement("div");
     back.className = "lumen-back";
     back.textContent = "\u2190 " + GU.back;
@@ -772,6 +850,7 @@
     });
     body.textContent = "";
     guShowClearBtn(false);
+    guOwnList(null);
 
     var back = document.createElement("div");
     back.className = "lumen-back";
@@ -1009,6 +1088,7 @@
     var GU = guStrings();
     body.textContent = "";
     guShowClearBtn(false);
+    guOwnList(null);
     var cancelled = false, active = null;
     var back = document.createElement("div");
     back.className = "lumen-back"; back.textContent = "\u2190 " + GU.back;
@@ -1164,6 +1244,7 @@
     var GU = guStrings();
     // Returning to the list (or first render): the global clear button applies.
     guShowClearBtn(true);
+    guOwnList(body);
     body.textContent = "";
     var note = document.createElement("div");
     note.className = "lumen-note";
@@ -1180,54 +1261,74 @@
 
     var listWrap = document.createElement("div");
     body.appendChild(listWrap);
-    listWrap.textContent = "Loading\u2026";
 
-    preloadGameUpdates()
+    // The chrome above (note, actions, search box) survives a repaint, so the
+    // query the user typed keeps applying to whatever the list holds.
+    var cards = [];
+    var applyFilter = function () {
+      var q = search.value.trim().toLowerCase();
+      cards.forEach(function (c) {
+        var nameEl = c.__nameEl;
+        var hay = (String(c.__appid) + " " + (nameEl ? nameEl.textContent : "")).toLowerCase();
+        c.style.display = (q === "" || hay.indexOf(q) !== -1) ? "" : "none";
+      });
+    };
+    search.addEventListener("input", applyFilter);
+
+    var paint = function (data) {
+      var normalized = normalizeGameUpdatesData(data);
+      _providersOffline = normalized.providers_offline;
+      // Fingerprint the same normalized data that the renderer consumes. This
+      // prevents cjson's empty-table representation ({}) from looking different
+      // from the normalized empty array ([]) on the next revalidation.
+      _gameUpdatesRendered = gameUpdatesSignature(normalized);
+      var games = normalized.games;
+      listWrap.textContent = "";
+      cards = [];
+      if (games.length === 0) {
+        var empty = document.createElement("div");
+        empty.className = "lumen-empty";
+        empty.textContent = GU.none;
+        listWrap.appendChild(empty);
+        return;
+      }
+      // Build all cards into a detached fragment, then attach once: identical
+      // final DOM, but one reflow instead of one per card (snappier with many
+      // games). Cache each card's name element so the search filter doesn't
+      // re-query the DOM per keystroke (textContent is still read live, so the
+      // async store-name update is reflected).
+      var frag = document.createDocumentFragment();
+      cards = games.map(function (g) {
+        var card = gameCard(g);
+        card.__versRef.__bodyRef = body;
+        card.__appid = g.appid;
+        card.__nameEl = card.querySelector(".lumen-game-name");
+        frag.appendChild(card);
+        return card;
+      });
+      listWrap.appendChild(frag);
+      applyFilter();
+    };
+    // Reachable from revalidateGameUpdates once this panel owns the list.
+    body.__guPaint = paint;
+
+    if (_gameUpdatesCache) {
+      // Instant on re-entry, then confirmed against disk in the background so a
+      // game added elsewhere shows up without a manual reload.
+      paint(_gameUpdatesCache);
+      revalidateGameUpdates();
+      return Promise.resolve(_gameUpdatesCache);
+    }
+
+    var renderGeneration = _gameUpdatesGeneration;
+    listWrap.textContent = "Loading\u2026";
+    return preloadGameUpdates()
       .then(function (data) {
-        _providersOffline = !!data.providers_offline;
-        // Lua serializes an empty array as {} (an object), so coerce every list
-        // back to an array before we filter/iterate, and drop games that ended
-        // up with no archived versions (e.g. after a manifest purge).
-        var arr = function (x) { return Array.isArray(x) ? x : []; };
-        var games = arr(data.games).filter(function (g) {
-          g.depots = arr(g.depots);
-          g.dlc_appids = arr(g.dlc_appids);
-          g.depots.forEach(function (d) { d.versions = arr(d.versions); });
-          return g.depots.length > 0;
-        });
-        listWrap.textContent = "";
-        if (games.length === 0) {
-          var empty = document.createElement("div");
-          empty.className = "lumen-empty";
-          empty.textContent = GU.none;
-          listWrap.appendChild(empty);
-          return;
-        }
-        // Build all cards into a detached fragment, then attach once: identical
-        // final DOM, but one reflow instead of one per card (snappier with many
-        // games). Cache each card's name element so the search filter doesn't
-        // re-query the DOM per keystroke (textContent is still read live, so the
-        // async store-name update is reflected).
-        var frag = document.createDocumentFragment();
-        var cards = games.map(function (g) {
-          var card = gameCard(g);
-          card.__versRef.__bodyRef = body;
-          card.__appid = g.appid;
-          card.__nameEl = card.querySelector(".lumen-game-name");
-          frag.appendChild(card);
-          return card;
-        });
-        listWrap.appendChild(frag);
-        search.addEventListener("input", function () {
-          var q = search.value.trim().toLowerCase();
-          cards.forEach(function (c) {
-            var nameEl = c.__nameEl;
-            var hay = (String(c.__appid) + " " + (nameEl ? nameEl.textContent : "")).toLowerCase();
-            c.style.display = (q === "" || hay.indexOf(q) !== -1) ? "" : "none";
-          });
-        });
+        if (renderGeneration !== _gameUpdatesGeneration) return;
+        paint(data);
       })
       .catch(function (e) {
+        if (renderGeneration !== _gameUpdatesGeneration) return;
         listWrap.textContent = "";
         var err = document.createElement("div");
         err.className = "lumen-err";

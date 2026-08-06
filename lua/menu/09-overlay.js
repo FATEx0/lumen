@@ -251,7 +251,13 @@
       guBody.style.display = which === "gu" ? "block" : "none";
       if (cloudBody) cloudBody.style.display = which === "cloud" ? "block" : "none";
       aboutBody.style.display = which === "about" ? "block" : "none";
+      var warm = !!initialized[which];
       ensureTab(which);
+      // The panel keeps its DOM, so coming back to an already-loaded Game
+      // Updates tab shows it instantly; confirm the list against disk in the
+      // background so a game added meanwhile (LuaTools, the Fixes menu) appears
+      // without the user having to reopen the overlay.
+      if (which === "gu" && warm) revalidateGameUpdates();
       if (which === "gu") {
         h.textContent = "";
         var gt = document.createElement("span");
