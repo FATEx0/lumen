@@ -140,7 +140,9 @@
           del.title = GU.delTitle;
           del.addEventListener("click", function (e) {
             e.stopPropagation();
-            call("DeleteManifest", { json: JSON.stringify({ depot: d.depot, gid: v.gid }) })
+            call("DeleteManifest", { json: JSON.stringify({
+              appid: game.appid, depot: d.depot, gid: v.gid,
+            }) })
               .then(function () {
                 invalidateGameUpdatesCache();
                 if (row.parentNode) row.remove();
@@ -587,6 +589,60 @@
     }, Promise.resolve()).then(function () { return warnings; });
   }
 
+  function importedIdentityMetadataError(appid) {
+    return "identity_metadata_unavailable: " + guStrings().identityMetadataUnavailable
+      .replace("{appid}", appid);
+  }
+
+  // Store metadata is the identity authority for imported apps. Do not infer a
+  // missing type from the Lua shape: a DLC can otherwise be published as a
+  // base game, and a self-referential fullgame field is not a usable relation.
+  // Return a blocking message, or null when the identity is structurally valid.
+  function validateImportedIdentityDetails(appid, details) {
+    if (!details || details.metadataAvailable !== true) {
+      return importedIdentityMetadataError(appid);
+    }
+    var rawType = typeof details.type === "string" ? details.type.trim() : "";
+    var type = rawType.toLowerCase();
+    if (!type) return importedIdentityMetadataError(appid);
+    if (type !== "dlc") return null;
+
+    var rawFullgame = details.fullgameAppid == null
+      ? "" : String(details.fullgameAppid).trim();
+    var fullgame = Number(rawFullgame);
+    if (!/^\d+$/.test(rawFullgame) || !isFinite(fullgame) || fullgame <= 0
+        || fullgame === Number(appid)) {
+      return "identity_dlc_metadata: " + guStrings().identityDlcMetadata
+        .replace("{appid}", appid);
+    }
+    return "identity_dlc: " + guStrings().identityDlc
+      .replace("{appid}", appid)
+      .replace("{fullgame}", fullgame);
+  }
+
+  function validateImportedIdentities(prepared) {
+    prepared = prepared || {};
+    var errors = Array.isArray(prepared.importErrors) ? prepared.importErrors.slice() : [];
+    var seen = {};
+    errors.forEach(function (message) { seen[message] = true; });
+    var apps = Array.isArray(prepared.apps) ? prepared.apps : [];
+    return Promise.all(apps.map(function (app) {
+      return fetchAppDetails(app.appid).then(function (details) {
+        var identityError = validateImportedIdentityDetails(app.appid, details);
+        if (!identityError || seen[identityError]) return;
+        seen[identityError] = true;
+        errors.push(identityError);
+      }).catch(function (error) {
+        log("validate imported identity", error);
+        var unavailable = importedIdentityMetadataError(app.appid);
+        if (!seen[unavailable]) { seen[unavailable] = true; errors.push(unavailable); }
+      });
+    })).then(function () {
+      prepared.importErrors = errors;
+      return prepared;
+    });
+  }
+
   function renderImportSummary(body, session, prepared, extraWarnings) {
     var GU = guStrings();
     body.textContent = "";
@@ -638,8 +694,13 @@
         label.textContent = "App " + app.appid;
         fetchAppName(app.appid).then(function (name) { if (name) label.textContent = name + "  ·  " + app.appid; });
         var detail = document.createElement("small");
+        var identity = app.identity || {};
+        var identitySource = app.identitySource || identity.source || "";
+        var identityConfidence = app.identityConfidence || identity.confidence || "";
         detail.textContent = (app.keys || 0) + " " + GU.keysLabel + "  ·  "
           + (app.pins || 0) + " " + GU.manifestsLabel
+          + (identitySource ? "  ·  " + GU.identitySource + ": " + identitySource
+            + (identityConfidence ? " (" + identityConfidence + ")" : "") : "")
           + (app.installed ? "  ·  " + GU.current : "");
         row.appendChild(label); row.appendChild(detail); appList.appendChild(row);
       });
@@ -648,6 +709,8 @@
 
     var warnings = (Array.isArray(prepared.warnings) ? prepared.warnings : []).concat(extraWarnings || []);
     warnings.forEach(function (warning) { addLine(body, warning, "advanced", "!"); });
+    var importErrors = Array.isArray(prepared.importErrors) ? prepared.importErrors : [];
+    importErrors.forEach(function (message) { addLine(body, message, "danger", "!"); });
     if (!apps.length && manifests.length) addLine(body, GU.manifestOnlyNote, "info", "i");
 
     var error = document.createElement("div");
@@ -662,7 +725,12 @@
     var commit = document.createElement("button");
     commit.className = "lumen-mbtn primary";
     commit.textContent = GU.importConfirm;
+    if (importErrors.length) {
+      commit.disabled = true; // importErrors block publication until resolved.
+      error.textContent = importErrors.join(" ");
+    }
     commit.addEventListener("click", function () {
+      if (importErrors.length) return;
       commit.disabled = true; error.textContent = ""; commit.textContent = GU.importing;
       call("CommitGameImport", { json: JSON.stringify({ session: session }) })
         .then(parseRpc)
@@ -712,8 +780,10 @@
           .then(parseRpc).then(function (finalPrep) { return { prepared: finalPrep, warnings: warnings }; });
       });
     }).then(function (result) {
-      prog.close();
-      renderImportSummary(body, session, result.prepared, result.warnings);
+      return validateImportedIdentities(result.prepared).then(function (prepared) {
+        prog.close();
+        renderImportSummary(body, session, prepared, result.warnings);
+      });
     }).catch(function (e) {
       prog.close();
       if (session) call("CancelGameImport", { json: JSON.stringify({ session: session }) }).catch(function () {});
@@ -755,6 +825,7 @@
     } catch (e) {}
     var fallback = {
       name: "App " + appid, image: capsuleUrl(appid), dlc: [],
+      type: null, fullgameAppid: null, metadataAvailable: false,
     };
     var request;
     try {
@@ -763,9 +834,14 @@
         .then(function (json) {
           var data = json && json[appid] && json[appid].success && json[appid].data;
           if (!data) return fallback;
+          var fullgame = data.fullgame && data.fullgame.appid;
+          var fullgameAppid = /^\d+$/.test(String(fullgame || "")) ? Number(fullgame) : null;
           var value = {
             name: data.name || fallback.name,
             image: data.header_image || data.capsule_image || fallback.image,
+            type: typeof data.type === "string" ? data.type : null,
+            fullgameAppid: fullgameAppid,
+            metadataAvailable: true,
             dlc: Array.isArray(data.dlc) ? data.dlc.filter(function (id) { return /^\d+$/.test(String(id)); }) : [],
           };
           try { localStorage.setItem(key, JSON.stringify({ savedAt: Date.now(), value: value })); } catch (e) {}
@@ -843,6 +919,10 @@
   function renderGameCreatorEditor(body, source, details) {
     var GU = guStrings();
     var draft = source.draft || {};
+    details = details || {};
+    var importErrors = [];
+    var identityError = validateImportedIdentityDetails(source.appid, details);
+    if (identityError) importErrors.push(identityError);
     var dlcInputs = [], depotRows = [];
     var baseDepots = {};
     (Array.isArray(draft.baseDepots) ? draft.baseDepots : []).forEach(function (id) {
@@ -1030,6 +1110,7 @@
     builder.appendChild(latestNote);
     var error = document.createElement("div");
     error.className = "lumen-err";
+    if (importErrors.length) error.textContent = importErrors.join(" ");
     builder.appendChild(error);
     var actions = document.createElement("div");
     actions.className = "lumen-builder-actions";
@@ -1039,7 +1120,9 @@
     var committedResult = null;
     var commit = document.createElement("button");
     commit.className = "lumen-mbtn primary"; commit.textContent = GU.addGame;
+    if (importErrors.length) commit.disabled = true; // importErrors block this identity.
     commit.addEventListener("click", function () {
+      if (importErrors.length) return;
       error.textContent = "";
       var request = buildDraftLuaRequest(source.appid, dlcInputs, depotRows);
       var invalidDlc = request.dlc_appids.some(function (id) { return !/^\d+$/.test(id); });

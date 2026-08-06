@@ -19,6 +19,29 @@ ok(/accept\s*=\s*["'][^"']*\.lua[^"']*\.manifest[^"']*\.zip/.test(ui),
 ok(ui.includes('call("BeginGameImport"') && ui.includes('call("UploadGameImportChunk"')
   && ui.includes('call("PrepareGameImport"') && ui.includes('call("CommitGameImport"'),
   "importer uses staged chunked backend transaction");
+ok(/identitySource|identityConfidence|identity source|confidence/.test(ui),
+  "import review carries the resolved base identity and confidence");
+ok(/identityMetadataUnavailable\s*:\s*["'][^"']+["']/.test(i18n)
+  && /identityMetadataUnavailable\s*:\s*["'][^"']+["']/.test(i18n.slice(i18n.indexOf('"pt-BR"'))),
+  "identity metadata failures have localized blocking copy");
+ok(/commit\.disabled\s*=\s*true[\s\S]*importErrors/.test(ui)
+  && /identity_dlc/.test(ui),
+  "a confirmed DLC identity issue blocks import commit instead of silently rewriting it");
+ok(/function validateImportedIdentities\(prepared\)[\s\S]*validateImportedIdentityDetails\(app\.appid, details\)/.test(ui)
+  && /function validateImportedIdentityDetails\(appid, details\)[\s\S]*metadataAvailable !== true[\s\S]*importedIdentityMetadataError/.test(ui)
+  && /identity_metadata_unavailable/.test(ui),
+  "batch imports fail closed when Steam identity metadata is unavailable");
+ok(/function validateImportedIdentityDetails\(appid, details\)[\s\S]*details\.type[\s\S]*\.trim\(\)[\s\S]*toLowerCase\(\)/.test(ui)
+  && /function validateImportedIdentityDetails\(appid, details\)[\s\S]*type\s*!==\s*["']dlc["'][\s\S]*fullgameAppid/.test(ui),
+  "identity validation requires a type and validates DLC full-game metadata");
+ok(/validateImportedIdentities\(prepared\)[\s\S]*validateImportedIdentityDetails\(app\.appid, details\)/.test(ui)
+  && /function renderGameCreatorEditor[\s\S]*validateImportedIdentityDetails\(source\.appid, details\)/.test(ui),
+  "batch and creator share the same identity metadata validator");
+ok(/function renderGameCreatorEditor[\s\S]*validateImportedIdentityDetails\(source\.appid, details\)/.test(ui)
+  && /identity_dlc_metadata/.test(ui),
+  "creator fails closed on unknown metadata and invalid DLC relations");
+ok(/validateImportedIdentities\(result\.prepared\)[\s\S]*renderImportSummary/.test(ui),
+  "identity validation runs before the import review can commit");
 ok(ui.includes("renderGameCreator") && ui.includes("buildDraftLuaRequest"),
   "Add game opens a dedicated creator view");
 ok(/add\.className\s*=\s*["']lumen-mbtn primary["']/.test(ui),

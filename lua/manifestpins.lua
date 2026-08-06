@@ -106,22 +106,45 @@ end
 --   * addappid(id)               -> a bare appid; the FIRST is the base app,
 --                                   the rest (minus base) are DLC/child appids.
 --   * setManifestid(depot,"gid") -> the LuaTools-shipped gid for that depot.
+local function new_lua_parse()
+  return {
+    base = nil, depots = {}, dlc_appids = {}, bare_appids = {},
+    keyed_appids = {}, declarations = {},
+  }
+end
+
+local function record_lua_declaration(out, kind, id)
+  out.declarations[#out.declarations + 1] = { kind = kind, id = id }
+  if kind == "bare" then out.bare_appids[#out.bare_appids + 1] = id
+  else out.keyed_appids[#out.keyed_appids + 1] = id end
+end
+
+local function finish_legacy_lua_parse(out)
+  if out.bare_appids[1] then out.base = out.bare_appids[1] end
+  local seen = {}
+  for _, id in ipairs(out.bare_appids) do
+    if id ~= out.base and not seen[id] then
+      out.dlc_appids[#out.dlc_appids + 1] = id
+      seen[id] = true
+    end
+  end
+  return out
+end
+
+-- parse_lua(text) -> declarations plus the legacy first-bare base guess.
 function mp.parse_lua(text)
-  local out = { base = nil, depots = {}, dlc_appids = {} }
-  local bare = {}
-  for line in (text .. "\n"):gmatch("([^\n]*)\n") do
-    -- keyed depot: addappid(id, type, "key")
+  local out = new_lua_parse()
+  for line in (tostring(text or "") .. "\n"):gmatch("([^\n]*)\n") do
     local kid, kkey = line:match('addappid%s*%(%s*(%d+)%s*,%s*%d+%s*,%s*"([^"]*)"%s*%)')
     if kid then
       kid = math.tointeger(tonumber(kid))
+      record_lua_declaration(out, "keyed", kid)
       out.depots[kid] = out.depots[kid] or {}
       out.depots[kid].key = kkey
     else
-      -- bare appid: addappid(id)   (no comma)
       local bid = line:match('addappid%s*%(%s*(%d+)%s*%)')
-      if bid then bare[#bare + 1] = math.tointeger(tonumber(bid)) end
+      if bid then record_lua_declaration(out, "bare", math.tointeger(tonumber(bid))) end
     end
-    -- manifest id (may be commented with a leading --)
     local mdepot, mgid = line:match('setManifestid%s*%(%s*(%d+)%s*,%s*"([^"]*)"')
     if mdepot then
       mdepot = math.tointeger(tonumber(mdepot))
@@ -129,11 +152,7 @@ function mp.parse_lua(text)
       out.depots[mdepot].manifestid = mgid
     end
   end
-  if bare[1] then out.base = bare[1] end
-  for i = 2, #bare do
-    if bare[i] ~= out.base then out.dlc_appids[#out.dlc_appids + 1] = bare[i] end
-  end
-  return out
+  return finish_legacy_lua_parse(out)
 end
 
 local function lua_long_open(line, pos)
@@ -145,11 +164,11 @@ end
 -- Removes comments and long bracket strings while preserving ordinary quoted
 -- arguments. The returned state carries a multiline block across input lines.
 local function strip_lua_non_code(line, long_close)
-  local out, pos = {}, 1
+  local out, pos, line_comment = {}, 1, nil
   while pos <= #line do
     if long_close then
       local first, last = line:find(long_close, pos, true)
-      if not first then return table.concat(out), long_close end
+      if not first then return table.concat(out), long_close, line_comment end
       out[#out + 1] = " "
       pos, long_close = last + 1, nil
     else
@@ -168,7 +187,10 @@ local function strip_lua_non_code(line, long_close)
         end
       elseif line:sub(pos, pos + 1) == "--" then
         local close, width = lua_long_open(line, pos + 2)
-        if not close then break end
+        if not close then
+          line_comment = line:sub(pos + 2)
+          break
+        end
         out[#out + 1] = " "
         long_close, pos = close, pos + 2 + width
       else
@@ -183,7 +205,7 @@ local function strip_lua_non_code(line, long_close)
       end
     end
   end
-  return table.concat(out), long_close
+  return table.concat(out), long_close, line_comment
 end
 
 -- Strict data parser for files crossing an import boundary. Unlike parse_lua,
@@ -191,20 +213,21 @@ end
 -- declarations. parse_lua remains intentionally permissive for reading legacy
 -- installed LuaTools files whose build marker may be commented out.
 function mp.parse_lua_strict(text)
-  local out = { base = nil, depots = {}, dlc_appids = {} }
-  local bare, long_close = {}, nil
+  local out = new_lua_parse()
+  local long_close = nil
   for raw in (tostring(text or "") .. "\n"):gmatch("([^\n]*)\n") do
     local cleaned
     cleaned, long_close = strip_lua_non_code(raw:gsub("\r$", ""), long_close)
     local line = cleaned:match("^%s*(.-)%s*$")
     local bid = line:match("^addappid%s*%(%s*(%d+)%s*%)%s*;?%s*$")
     if bid then
-      bare[#bare + 1] = math.tointeger(tonumber(bid))
+      record_lua_declaration(out, "bare", math.tointeger(tonumber(bid)))
     else
       local kid, _, quote, kkey = line:match(
-        "^addappid%s*%(%s*(%d+)%s*,%s*(%d+)%s*,%s*(['\"])([0-9A-Fa-f]+)%3%s*%)%s*;?%s*$")
+        "^addappid%s*%(%s*(%d+)%s*,%s*(%d+)%s*,%s*(['\"])([^'\"]*)%3%s*%)%s*;?%s*$")
       if kid then
         kid = math.tointeger(tonumber(kid))
+        record_lua_declaration(out, "keyed", kid)
         out.depots[kid] = out.depots[kid] or {}
         out.depots[kid].key = kkey
       else
@@ -218,11 +241,7 @@ function mp.parse_lua_strict(text)
       end
     end
   end
-  if bare[1] then out.base = bare[1] end
-  for i = 2, #bare do
-    if bare[i] ~= out.base then out.dlc_appids[#out.dlc_appids + 1] = bare[i] end
-  end
-  return out
+  return finish_legacy_lua_parse(out)
 end
 
 local function positive_id(value)
@@ -248,6 +267,145 @@ local function valid_depot_key(value)
     and value:match("^[0-9A-Fa-f]+$") ~= nil
 end
 
+local function lua_filename_appid(filename)
+  local basename = tostring(filename or ""):gsub("\\\\", "/"):match("([^/]+)$")
+  if not basename then return nil end
+  local id = basename:match("^(%d+)%s*%(%s*%d+%s*%)%.lua$")
+  if not id then id = basename:match("^(%d+)%.lua$") end
+  return positive_id(id)
+end
+
+local function lua_header_appid(text)
+  local long_close = nil
+  for raw in (tostring(text or "") .. "\n"):gmatch("([^\n]*)\n") do
+    local _, next_close, comment = strip_lua_non_code(raw:gsub("\r$", ""), long_close)
+    long_close = next_close
+    local id = comment and comment:match("^%s*(%d+)%s*%-%s*")
+    if id then return positive_id(id) end
+  end
+  return nil
+end
+
+local function unique_ids(values)
+  local result, seen = {}, {}
+  for _, value in ipairs(values or {}) do
+    if value and not seen[value] then
+      result[#result + 1], seen[value] = value, true
+    end
+  end
+  return result
+end
+
+local function identity_result(parsed, appid, source, confidence)
+  parsed.base = appid
+  parsed.source = source
+  parsed.confidence = confidence
+  parsed.identity_source = source
+  parsed.identity_confidence = confidence
+  parsed.dlc_appids = {}
+  local seen = {}
+  for _, id in ipairs(parsed.bare_appids or {}) do
+    if id ~= appid and not seen[id] then
+      parsed.dlc_appids[#parsed.dlc_appids + 1], seen[id] = id, true
+    end
+  end
+  return parsed
+end
+
+-- Resolve the game identity without allowing the first bare DLC declaration to
+-- become the base app. Strong hints are ordered but mutually checked; a
+-- conflict is an error rather than a silent repair. With no strong hint, one
+-- keyed declaration is safe, and multiple keyed declarations are safe only
+-- when the first structural declaration is keyed. A bare-only file keeps the
+-- old first-bare fallback for compatibility and is marked low confidence.
+function mp.resolve_lua_identity(text, hint)
+  if type(hint) ~= "table" then hint = { appid = hint } end
+  local parsed = mp.parse_lua_strict(text)
+  if #parsed.declarations == 0 then return nil, "Lua has no recognized declarations" end
+
+  local strong = {}
+  local function add_strong(source, value)
+    value = positive_id(value)
+    if value then strong[#strong + 1] = { source = source, id = value } end
+  end
+  add_strong("filename", lua_filename_appid(hint.filename or hint.name))
+  add_strong("header", lua_header_appid(text))
+  add_strong("explicit", hint.appid)
+  local selected
+  for _, candidate in ipairs(strong) do
+    if selected and selected.id ~= candidate.id then
+      return nil, string.format("conflicting Lua identity hints: %s=%d, %s=%d",
+        selected.source, selected.id, candidate.source, candidate.id)
+    end
+    selected = selected or candidate
+  end
+  if selected then return identity_result(parsed, selected.id, selected.source, "high") end
+
+  local keyed = unique_ids(parsed.keyed_appids)
+  local bare = unique_ids(parsed.bare_appids)
+  if #keyed == 1 then
+    if parsed.declarations[1] and parsed.declarations[1].kind == "bare" and bare[1] then
+      return identity_result(parsed, bare[1], "bare", "medium")
+    end
+    return identity_result(parsed, keyed[1], "keyed", "medium")
+  end
+  if #keyed > 1 then
+    local first = parsed.declarations[1]
+    if first and first.kind == "keyed" then
+      return identity_result(parsed, keyed[1], "keyed", "medium")
+    end
+    return nil, "ambiguous Lua identity: multiple keyed app candidates"
+  end
+  if #bare > 0 then return identity_result(parsed, bare[1], "bare", "low") end
+  return nil, "Lua has no app identity"
+end
+
+-- A manifest pin is valid when it has a real 64-hex depot key or when the
+-- corresponding binary manifest is already available locally/uploaded. The
+-- latter is required for keyless legacy files because there is no safe remote
+-- lookup identity to reconstruct from the Lua text alone.
+function mp.validate_import_pins(parsed, available_manifests)
+  local errors = {}
+  for depot, info in pairs(parsed and parsed.depots or {}) do
+    local gid = info and info.manifestid
+    if gid then
+      local normalized = decimal_id(gid)
+      if not normalized then
+        errors[#errors + 1] = "invalid manifest gid for depot " .. tostring(depot)
+      elseif not valid_depot_key(info.key) then
+        local token = tostring(depot) .. "_" .. normalized
+        if not (available_manifests and available_manifests[token]) then
+          errors[#errors + 1] = "manifest pin " .. token .. " has no key or available manifest"
+        end
+      end
+    end
+  end
+  return #errors == 0, errors
+end
+
+-- Validate depot ownership across one import batch and already-installed Lua
+-- registrations. Shared runtime depots are intentionally exempt because Steam
+-- reuses those fixed ids across unrelated apps.
+function mp.validate_import_ownership(apps, existing)
+  local owners = {}
+  for depot, appid in pairs(existing or {}) do
+    owners[depot] = appid
+  end
+  for _, app in ipairs(apps or {}) do
+    for depot in pairs(app.parsed and app.parsed.depots or app.depots or {}) do
+      if not mp.is_shared_depot(depot) then
+        local previous = owners[depot]
+        if previous and previous ~= app.appid then
+          return false, string.format("depot %d is declared by apps %d and %d",
+            depot, previous, app.appid)
+        end
+        owners[depot] = app.appid
+      end
+    end
+  end
+  return true, owners
+end
+
 local function sorted_numeric_keys(map)
   local keys = {}
   for key in pairs(map or {}) do keys[#keys + 1] = key end
@@ -255,23 +413,29 @@ local function sorted_numeric_keys(map)
   return keys
 end
 
--- merge_lua_text(appid, ...texts) -> canonical Lua, err. This is deliberately
--- data-only: only recognized addappid/setManifestid declarations survive, so a
--- selected file can never inject arbitrary Lua into Steam's startup path.
-function mp.merge_lua_text(appid, ...)
+-- Merge recognized data declarations into canonical Lua. `replace_pins` keeps
+-- declarations and keys from the existing file but takes the manifest set only
+-- from the newly imported text, so omitted old pins cannot survive a reimport.
+local function merge_lua_text_impl(appid, replace_pins, ...)
   appid = positive_id(appid)
   if not appid then return nil, "invalid appid" end
   local bare, keys, manifests = { [appid] = true }, {}, {}
-  for _, text in ipairs({ ... }) do
+  local texts = { ... }
+  for index, text in ipairs(texts) do
     if type(text) == "string" and text ~= "" then
-      local parsed = mp.parse_lua_strict(text)
-      if parsed.base and parsed.base ~= appid then
-        return nil, "Lua declares app " .. parsed.base .. ", expected " .. appid
+      local parsed, identity_err = mp.resolve_lua_identity(text, { appid = appid })
+      if not parsed then return nil, identity_err end
+      local mentions_app = false
+      for _, declaration in ipairs(parsed.declarations or {}) do
+        if declaration.id == appid then mentions_app = true; break end
       end
-      if not parsed.base and next(parsed.depots) == nil then
-        return nil, "Lua has no recognized game declarations"
+      if not mentions_app and #parsed.bare_appids > 0 then
+        return nil, "Lua declares app " .. tostring(parsed.bare_appids[1])
+          .. ", expected " .. appid
       end
-      for _, id in ipairs(parsed.dlc_appids or {}) do bare[id] = true end
+      for _, id in ipairs(parsed.bare_appids or {}) do
+        if id ~= appid then bare[id] = true end
+      end
       for depot, info in pairs(parsed.depots or {}) do
         if info.key then
           if not valid_depot_key(info.key) then
@@ -283,10 +447,10 @@ function mp.merge_lua_text(appid, ...)
           end
           keys[depot] = normalized
         end
-        if info.manifestid then
+        if info.manifestid and (not replace_pins or index > 1) then
           local gid = decimal_id(info.manifestid)
           if not gid then return nil, "invalid manifest gid for depot " .. depot end
-          manifests[depot] = gid -- later input is the user's explicit choice
+          manifests[depot] = gid
         end
       end
     end
@@ -302,6 +466,14 @@ function mp.merge_lua_text(appid, ...)
     lines[#lines + 1] = string.format('setManifestid(%d,"%s")', depot, manifests[depot])
   end
   return table.concat(lines, "\n") .. "\n"
+end
+
+function mp.merge_lua_text(appid, ...)
+  return merge_lua_text_impl(appid, false, ...)
+end
+
+function mp.merge_lua_text_replacing_pins(appid, ...)
+  return merge_lua_text_impl(appid, true, ...)
 end
 
 -- build_draft_lua(request) -> canonical Lua, err. Blank manifest GIDs are an
@@ -453,9 +625,15 @@ function mp.inspect_import_entries(entries)
     local name, data = tostring(entry.name or ""), entry.data
     local lower = name:lower()
     if lower:match("%.lua$") then
-      local parsed = mp.parse_lua_strict(type(data) == "string" and data or "")
-      if not parsed.base then return nil, "could not determine app id from " .. name end
-      out.luas[#out.luas + 1] = { name = name, appid = parsed.base, data = data, parsed = parsed }
+      local source = type(data) == "string" and data or ""
+      local parsed, identity_err = mp.resolve_lua_identity(source, { filename = name })
+      if not parsed then
+        return nil, name .. ": " .. tostring(identity_err)
+      end
+      out.luas[#out.luas + 1] = {
+        name = name, appid = parsed.base, data = data, parsed = parsed,
+        identity_source = parsed.source, identity_confidence = parsed.confidence,
+      }
     elseif lower:match("%.manifest$") then
       local meta, err = mp.parse_manifest(data)
       if not meta then return nil, name .. ": " .. tostring(err) end
@@ -475,6 +653,19 @@ function mp.inspect_import_entries(entries)
       end
     else
       out.warnings[#out.warnings + 1] = "Ignored " .. name
+    end
+  end
+  local owners = {}
+  for _, item in ipairs(out.luas) do
+    for depot in pairs(item.parsed.depots or {}) do
+      if not mp.is_shared_depot(depot) then
+        local owner = owners[depot]
+        if owner and owner ~= item.appid then
+          return nil, string.format("depot %d is declared by apps %d and %d",
+            depot, owner, item.appid)
+        end
+        owners[depot] = item.appid
+      end
     end
   end
   return out
@@ -1213,15 +1404,31 @@ local function list_dir(dir)
   return names
 end
 
--- delete_manifests_for_ids(manifests_dir, ids) -> removed_count. Deletes every
--- <depot>_<gid>.manifest whose depot id is in the `ids` set (used by the full
--- removal of a load-.lua game). No-op when the dir is absent.
-local function delete_manifests_for_ids(manifests_dir, ids)
+local function referenced_depots(stplug_dir, excluded_appid)
+  local referenced = {}
+  for _, name in ipairs(list_dir(stplug_dir)) do
+    local file_appid = name:match("^(%d+)%.lua$")
+    if file_appid and math.tointeger(tonumber(file_appid)) ~= excluded_appid then
+      local source = read_file(stplug_dir .. "/" .. name)
+      local parsed = source and mp.parse_lua_strict(source)
+      for depot in pairs(parsed and parsed.depots or {}) do referenced[depot] = true end
+    end
+  end
+  return referenced
+end
+
+-- delete_manifests_for_ids(manifests_dir, ids [, protected]) -> removed_count.
+-- Deletes every archived manifest whose depot belongs to `ids`, except shared
+-- runtime depots and depots still referenced by another stplug-in Lua file.
+local function delete_manifests_for_ids(manifests_dir, ids, protected)
   if not manifests_dir then return 0 end
   local removed = 0
   for _, name in ipairs(list_dir(manifests_dir)) do
     local depot = name:match("^(%d+)_%d+%.manifest$")
-    if depot and ids[math.tointeger(tonumber(depot))] then
+    local numeric_depot = depot and math.tointeger(tonumber(depot))
+    if numeric_depot and ids[numeric_depot]
+        and not mp.is_shared_depot(numeric_depot)
+        and not (protected and protected[numeric_depot]) then
       if os.remove(manifests_dir .. "/" .. name) then removed = removed + 1 end
     end
   end
@@ -1430,14 +1637,15 @@ function mp.build_games(ctx)
     -- the Steamworks redistributables).
     if appid and not mp.is_tool(appid) then
       local lua = read_file(ctx.stplug_dir .. "/" .. name) or ""
-      local parsed = mp.parse_lua(lua)
-      local installed = installed_gids(ctx.steam_root, appid, roots)
-      local appinfo = load_appinfo_metadata(ctx, appid)
-      local appPins = pins[appid] or { locked = false, depots = {} }
-      local has_workshop = app_has_workshop(ctx.steam_root, appid, roots)
+      local parsed = mp.resolve_lua_identity(lua, { filename = name })
+      if parsed then
+        local installed = installed_gids(ctx.steam_root, appid, roots)
+        local appinfo = load_appinfo_metadata(ctx, appid)
+        local appPins = pins[appid] or { locked = false, depots = {} }
+        local has_workshop = app_has_workshop(ctx.steam_root, appid, roots)
 
-      local depots = {}
-      for depot, info in pairs(parsed.depots) do
+        local depots = {}
+        for depot, info in pairs(parsed.depots) do
         local versions = archived_versions(ctx.manifests_dir, depot, manifest_index)
         if #versions > 0 then
           for _, v in ipairs(versions) do
@@ -1502,6 +1710,7 @@ function mp.build_games(ctx)
           synthetic = is_synthetic,
         }
       end
+      end
     end
   end
   return games
@@ -1511,11 +1720,13 @@ end
 -- delete_manifest(dir, depot, gid) -> ok, err. Removes a single archived
 -- <depot>_<gid>.manifest. depot/gid must be all-digits (guards against path
 -- traversal — the values flow in from the frontend).
-function mp.delete_manifest(manifests_dir, depot, gid)
+function mp.delete_manifest(manifests_dir, depot, gid, protected)
   if not manifests_dir then return false, "no manifests dir" end
   local d = math.tointeger(tonumber(depot))
   gid = tostring(gid)
   if not d or not gid:match("^%d+$") then return false, "bad depot/gid" end
+  if mp.is_shared_depot(d) then return false, "shared depot is protected" end
+  if protected and protected[d] then return false, "depot is referenced by another app" end
   local path = manifests_dir .. "/" .. d .. "_" .. gid .. ".manifest"
   local ok, err = os.remove(path)
   if not ok then return false, err or "remove failed" end
@@ -1560,6 +1771,11 @@ function mp.clear_manifests(ctx)
     end
   end
 
+  -- A depot referenced by any installed Lua registration may still be needed
+  -- by another app, even when none of its archived gids is currently marked
+  -- installed or pinned. Shared runtime depots are protected for the same
+  -- reason: their fixed IDs are reused across unrelated apps.
+  local referenced = referenced_depots(ctx.stplug_dir, nil)
   local names = {}
   local ok_lfs, lfs = pcall(require, "lfs")
   if ok_lfs then
@@ -1575,7 +1791,10 @@ function mp.clear_manifests(ctx)
   local removed, freed = 0, 0
   for _, name in ipairs(names) do
     local depot, gid = name:match("^(%d+)_(%d+)%.manifest$")
-    if depot and not keep[depot .. "_" .. gid] then
+    local numeric_depot = depot and math.tointeger(tonumber(depot)) or nil
+    if numeric_depot and not keep[depot .. "_" .. gid]
+        and not mp.is_shared_depot(numeric_depot)
+        and not referenced[numeric_depot] then
       local path = ctx.manifests_dir .. "/" .. name
       local data = read_file(path)
       if os.remove(path) then
@@ -1590,6 +1809,31 @@ end
 -- ── RPC methods (each returns a JSON string) ────────────────────────────────
 local function err(msg) return json.encode({ success = false, error = tostring(msg) }) end
 local function as_int(v) return math.tointeger(tonumber(v)) end
+
+local function disk_manifest_set(directory)
+  local available = {}
+  if not directory then return available end
+  local ok_lfs, lfs = pcall(require, "lfs")
+  if ok_lfs then
+    pcall(function()
+      for name in lfs.dir(directory) do
+        local depot, gid = name:match("^(%d+)_(%d+)%.manifest$")
+        if depot then available[depot .. "_" .. gid] = true end
+      end
+    end)
+  end
+  return available
+end
+
+local function canonicalize_import_lua(ctx, text, requested_appid)
+  local parsed, identity_err = mp.resolve_lua_identity(text, { appid = requested_appid })
+  if not parsed then return nil, nil, identity_err end
+  local pin_ok, pin_errors = mp.validate_import_pins(parsed, disk_manifest_set(ctx.manifests_dir))
+  if not pin_ok then return nil, nil, table.concat(pin_errors, "; ") end
+  local canonical, merge_err = mp.merge_lua_text(parsed.base, text)
+  if not canonical then return nil, nil, merge_err end
+  return canonical, parsed
+end
 
 -- ── Transactional multi-file importer ─────────────────────────────────────
 -- Files cross the CDP binding as small base64 chunks. The backend stores each
@@ -1801,6 +2045,47 @@ local function collect_import_entries(ctx, session, state)
   return entries
 end
 
+local function available_import_manifests(ctx, inspected)
+  local available = {}
+  for _, manifest in ipairs(inspected.manifests or {}) do
+    available[manifest.depot .. "_" .. manifest.gid] = true
+  end
+  if ctx.manifests_dir then
+    local ok_lfs, lfs = pcall(require, "lfs")
+    if ok_lfs then
+      pcall(function()
+        for name in lfs.dir(ctx.manifests_dir) do
+          local depot, gid = name:match("^(%d+)_(%d+)%.manifest$")
+          if depot then available[depot .. "_" .. gid] = true end
+        end
+      end)
+    end
+  end
+  return available
+end
+
+local function existing_import_depot_owners(ctx)
+  local owners = {}
+  if not ctx.stplug_dir then return owners end
+  local ok_lfs, lfs = pcall(require, "lfs")
+  if not ok_lfs then return owners end
+  pcall(function()
+    for name in lfs.dir(ctx.stplug_dir) do
+      local appid = name:match("^(%d+)%.lua$")
+      if appid then
+        local source = read_file(ctx.stplug_dir .. "/" .. name)
+        local parsed = source and mp.resolve_lua_identity(source, { filename = name })
+        if parsed then
+          for depot in pairs(parsed.depots or {}) do
+            if not owners[depot] then owners[depot] = parsed.base end
+          end
+        end
+      end
+    end
+  end)
+  return owners
+end
+
 local function build_import_plan(ctx, session, state)
   local entries, cerr = collect_import_entries(ctx, session, state)
   if not entries then return nil, cerr end
@@ -1820,23 +2105,38 @@ local function build_import_plan(ctx, session, state)
       table.insert(grouped[appid], 1, text)
     end
   end
+
+  local available = available_import_manifests(ctx, inspected)
   local apps = {}
   for appid, texts in pairs(grouped) do
     local merged, merr = mp.merge_lua_text(appid, table.unpack(texts))
     if not merged then return nil, merr end
-    local parsed = mp.parse_lua(merged)
+    local parsed, identity_err = mp.resolve_lua_identity(merged, { appid = appid })
+    if not parsed then return nil, identity_err end
+    local pin_ok, pin_errors = mp.validate_import_pins(parsed, available)
+    if not pin_ok then
+      return nil, string.format("app %d: %s", appid, table.concat(pin_errors, "; "))
+    end
     local pin_count = 0
-    for _, info in pairs(parsed.depots) do if info.manifestid then pin_count = pin_count + 1 end end
+    for _, info in pairs(parsed.depots) do
+      if info.manifestid then pin_count = pin_count + 1 end
+    end
     apps[#apps + 1] = {
-      appid = appid, text = merged, pins = pin_count,
+      appid = appid, text = merged, parsed = parsed, pins = pin_count,
+      identity_source = parsed.source, identity_confidence = parsed.confidence,
       installed = next(installed_gids(ctx.steam_root, appid)) ~= nil,
     }
   end
+  local ownership_ok, ownership_err = mp.validate_import_ownership(
+    apps, existing_import_depot_owners(ctx))
+  if not ownership_ok then return nil, ownership_err end
   table.sort(apps, function(a, b) return a.appid < b.appid end)
   table.sort(inspected.manifests, function(a, b)
     return a.depot == b.depot and a.gid < b.gid or a.depot < b.depot
   end)
-  return { apps = apps, manifests = inspected.manifests, warnings = inspected.warnings }
+  return {
+    apps = apps, manifests = inspected.manifests, warnings = inspected.warnings,
+  }
 end
 
 -- EnrichGameImport{session, appid, lua}: attach the canonical source-generated
@@ -1857,8 +2157,8 @@ function mp.enrich_game_import_rpc(ctx, json_str)
   local has_app = false
   for _, entry in ipairs(entries) do
     if tostring(entry.name):lower():match("%.lua$") then
-      local parsed = mp.parse_lua(entry.data or "")
-      if parsed.base == appid then has_app = true; break end
+      local parsed = mp.resolve_lua_identity(entry.data or "", { filename = entry.name })
+      if parsed and parsed.base == appid then has_app = true; break end
     end
   end
   if not has_app then return err("import session does not contain app " .. appid) end
@@ -1885,10 +2185,13 @@ function mp.prepare_game_import_rpc(ctx, json_str)
   if not sw then return err(se) end
   local apps, manifests = {}, {}
   for _, app in ipairs(plan.apps) do
-    local parsed, keys = mp.parse_lua(app.text), 0
+    local parsed, keys = app.parsed or mp.resolve_lua_identity(app.text, { appid = app.appid }), 0
     for _, info in pairs(parsed.depots) do if info.key then keys = keys + 1 end end
     apps[#apps + 1] = {
       appid = app.appid, pins = app.pins, keys = keys, installed = app.installed,
+      identitySource = app.identity_source, identityConfidence = app.identity_confidence,
+      identity = { appid = app.appid, source = app.identity_source,
+        confidence = app.identity_confidence },
     }
   end
   for _, man in ipairs(plan.manifests) do
@@ -1974,7 +2277,8 @@ function mp.commit_game_import_rpc(ctx, json_str)
     -- Smart source enrichment may have completed after Prepare. Read it now and
     -- merge it first, preserving its keys while the uploaded Lua wins on pins.
     local target = ctx.stplug_dir .. "/" .. app.appid .. ".lua"
-    local merged, merr = mp.merge_lua_text(app.appid, read_file(target) or "", app.text)
+    local merged, merr = mp.merge_lua_text_replacing_pins(
+      app.appid, read_file(target) or "", app.text)
     if not merged then return err(merr) end
     publications[#publications + 1] = { path = target, data = merged }
     local parsed, depot_gids = mp.parse_lua(merged), {}
@@ -2103,12 +2407,11 @@ function mp.import_lua_pin_rpc(ctx, json_str)
   if not ok or type(req) ~= "table" or type(req.lua) ~= "string" then
     return err("bad request")
   end
-  local parsed = mp.parse_lua(req.lua)
-  local appid = as_int(req.appid) or parsed.base
+  local requested = positive_id(req.appid)
+  local _, parsed, import_err = canonicalize_import_lua(ctx, req.lua, requested)
+  if not parsed then return err(import_err) end
+  local appid = parsed.base
   if not appid then return err("could not determine app id from .lua") end
-  if parsed.base and as_int(req.appid) and parsed.base ~= as_int(req.appid) then
-    return err("this .lua is for app " .. parsed.base .. ", not " .. as_int(req.appid))
-  end
 
   local depot_gids = {}
   local count = 0
@@ -2134,12 +2437,11 @@ function mp.sync_game_pins_rpc(ctx, json_str)
   if not ok or type(req) ~= "table" or type(req.lua) ~= "string" then
     return err("bad request")
   end
-  local parsed = mp.parse_lua(req.lua)
-  local appid = positive_id(req.appid) or parsed.base
+  local requested = positive_id(req.appid)
+  local _, parsed, import_err = canonicalize_import_lua(ctx, req.lua, requested)
+  if not parsed then return err(import_err) end
+  local appid = parsed.base
   if not appid then return err("could not determine app id from .lua") end
-  if parsed.base and parsed.base ~= appid then
-    return err("this .lua is for app " .. parsed.base .. ", not " .. appid)
-  end
   local depot_gids, count = {}, 0
   for depot, info in pairs(parsed.depots) do
     if info.manifestid then depot_gids[depot] = info.manifestid; count = count + 1 end
@@ -2170,37 +2472,36 @@ function mp.import_lua_full_rpc(ctx, json_str)
   if not ok or type(req) ~= "table" or type(req.lua) ~= "string" then
     return err("bad request")
   end
-  local parsed = mp.parse_lua(req.lua)
-  local appid = as_int(req.appid) or parsed.base
+  local requested = positive_id(req.appid)
+  local canonical, parsed, import_err = canonicalize_import_lua(ctx, req.lua, requested)
+  if not parsed then return err(import_err) end
+  local appid = parsed.base
   if not appid then return err("could not determine app id from .lua") end
-  if parsed.base and as_int(req.appid) and parsed.base ~= as_int(req.appid) then
-    return err("this .lua is for app " .. parsed.base .. ", not " .. as_int(req.appid))
-  end
 
-  -- 1) write the .lua (depot keys) to stplug-in.
-  local lok, lerr = write_lua_file(ctx.stplug_dir, appid, req.lua)
-  if not lok then return err(lerr) end
-
-  -- 2) collect setManifestid pins (optional — a keys-only .lua is valid).
+  -- Collect setManifestid pins before publication (a keys-only .lua is valid).
   local depot_gids, count = {}, 0
   for depot, info in pairs(parsed.depots) do
     if info.manifestid then depot_gids[depot] = info.manifestid; count = count + 1 end
   end
 
-  -- 3) apply the setManifestid pins (if any) to config.yaml. The appid is NOT
-  -- mirrored into config.yaml AdditionalApps: the stplug-in/<appid>.lua just
-  -- written IS the canonical registration (slsteam-moon discovers the app from
-  -- the .lua filename stem). A keys-only .lua carries no pins, so it needs no
-  -- config.yaml write at all.
-  if count > 0 then
-    local cfg = read_file(ctx.config_path)
-    if not cfg then return err("config.yaml not found") end
-    local pins = mp.parse_pins(cfg)
-    mp.set_game_pin(pins, appid, depot_gids)
-    local newcfg = mp.splice_pins(cfg, pins)
-    local cwok, cwerr = write_config_raw(ctx.config_path, newcfg)
-    if not cwok then return err(cwerr) end
+  -- Validate and prepare the complete new state before replacing either live
+  -- file. `publish_import` stages both files and restores their old contents if
+  -- a later rename fails, so a rejected config can never leave a new Lua file
+  -- paired with the old ManifestPins entry.
+  local cfg = read_file(ctx.config_path)
+  if not looks_like_config(cfg) then
+    return err("config.yaml not found or invalid")
   end
+  local pins = mp.parse_pins(cfg)
+  if count > 0 then mp.set_game_pin(pins, appid, depot_gids)
+  else mp.clear_game_pin(pins, appid) end
+  local newcfg = mp.splice_pins(cfg, pins)
+  if not mkdir_p(ctx.stplug_dir) then return err("could not create stplug-in directory") end
+  local pok, perr = publish_import({
+    { path = ctx.stplug_dir .. "/" .. tostring(appid) .. ".lua", data = canonical },
+    { path = ctx.config_path, data = newcfg },
+  })
+  if not pok then return err(perr) end
   mp.invalidate_appinfo_cache(ctx, appid)
   -- Record that this game was added by loading a .lua (not the LuaTools DB) so
   -- its build badge reads "from .lua". Best-effort: a failed mark only costs the
@@ -2235,12 +2536,11 @@ function mp.inspect_lua_rpc(ctx, json_str)
   if not ok or type(req) ~= "table" or type(req.lua) ~= "string" then
     return err("bad request")
   end
-  local parsed = mp.parse_lua(req.lua)
-  local appid = as_int(req.appid) or parsed.base
+  local requested = positive_id(req.appid)
+  local _, parsed, import_err = canonicalize_import_lua(ctx, req.lua, requested)
+  if not parsed then return err(import_err) end
+  local appid = parsed.base
   if not appid then return err("could not determine app id from .lua") end
-  if parsed.base and as_int(req.appid) and parsed.base ~= as_int(req.appid) then
-    return err("this .lua is for app " .. parsed.base .. ", not " .. as_int(req.appid))
-  end
   local count = 0
   for _, info in pairs(parsed.depots) do if info.manifestid then count = count + 1 end end
   -- alreadyOnBuild: the game is installed AND every depot the .lua pins is
@@ -2256,6 +2556,7 @@ function mp.inspect_lua_rpc(ctx, json_str)
   end
   local already_on_build = installed and count > 0 and matched == count
   return json.encode({ success = true, appid = appid,
+    source = parsed.source, confidence = parsed.confidence,
     installed = installed, pinned = count, alreadyOnBuild = already_on_build })
 end
 
@@ -2266,7 +2567,13 @@ function mp.delete_manifest_rpc(ctx, json_str)
   if not ok or type(req) ~= "table" or not req.depot or not req.gid then
     return err("bad request")
   end
-  local dok, derr = mp.delete_manifest(ctx.manifests_dir, req.depot, req.gid)
+  local protected = nil
+  if req.appid then
+    local appid = positive_id(req.appid)
+    if not appid then return err("bad appid") end
+    protected = referenced_depots(ctx.stplug_dir, appid)
+  end
+  local dok, derr = mp.delete_manifest(ctx.manifests_dir, req.depot, req.gid, protected)
   if not dok then return err(derr) end
   return json.encode({ success = true })
 end
@@ -2306,12 +2613,13 @@ function mp.delete_build_rpc(ctx, json_str)
   local hi = lo + 86399
 
   local keep = game_keep_set(game)
+  local protected = referenced_depots(ctx.stplug_dir, appid)
   local removed = 0
   for _, dep in ipairs(game.depots) do
     for _, v in ipairs(dep.versions) do
       if v.date and v.date >= lo and v.date <= hi
          and not keep[dep.depot .. "_" .. v.gid] then
-        if mp.delete_manifest(ctx.manifests_dir, dep.depot, v.gid) then removed = removed + 1 end
+        if mp.delete_manifest(ctx.manifests_dir, dep.depot, v.gid, protected) then removed = removed + 1 end
       end
     end
   end
@@ -2344,7 +2652,8 @@ function mp.delete_all_rpc(ctx, json_str)
     for d in pairs(parsed.depots) do ids[d] = true end
     for _, d in ipairs(parsed.dlc_appids) do ids[d] = true end
 
-    local removed = delete_manifests_for_ids(ctx.manifests_dir, ids)
+    local protected = referenced_depots(ctx.stplug_dir, appid)
+    local removed = delete_manifests_for_ids(ctx.manifests_dir, ids, protected)
     remove_lua_files(ctx.stplug_dir, appid)
 
     local cfg = read_file(ctx.config_path)
@@ -2366,12 +2675,13 @@ function mp.delete_all_rpc(ctx, json_str)
   for _, g in ipairs(games) do if g.appid == appid then game = g; break end end
   if not game then return err("unknown app") end
   local keep = game_keep_set(game)
+  local protected = referenced_depots(ctx.stplug_dir, appid)
   local removed, kept = 0, 0
   for _, dep in ipairs(game.depots) do
     for _, v in ipairs(dep.versions) do
       if keep[dep.depot .. "_" .. v.gid] then
         kept = kept + 1
-      elseif mp.delete_manifest(ctx.manifests_dir, dep.depot, v.gid) then
+      elseif mp.delete_manifest(ctx.manifests_dir, dep.depot, v.gid, protected) then
         removed = removed + 1
       end
     end

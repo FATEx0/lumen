@@ -67,6 +67,50 @@ do
   check(not dlc[250902], "lua: keyed depot not in dlc_appids")
 end
 
+-- ── 2a. Lua identity resolution ────────────────────────────────────────────
+do
+  local key = string.rep("a", 64)
+  local luie = table.concat({
+    "-- Generated with Luie",
+    "-- 3321460 - Crimson Desert",
+    'addappid(3321460, 1, "' .. key .. '")',
+    'addappid(3321461, 1, "' .. string.rep("b", 64) .. '")',
+    "setManifestid(3321461, \"3181503578355214830\")",
+    "addappid(4024620)",
+    "addappid(4572870)",
+  }, "\n")
+  local by_name, name_err = mp.resolve_lua_identity(luie, {
+    filename = "3321460 (1).lua",
+  })
+  check(by_name ~= nil and name_err == nil, "identity: Luie file resolves")
+  eq(by_name and by_name.base, 3321460, "identity: filename stem wins over bare DLCs")
+  eq(by_name and by_name.source, "filename", "identity: filename is recorded as source")
+  local dlcs = {}
+  for _, id in ipairs(by_name and by_name.dlc_appids or {}) do dlcs[id] = true end
+  check(dlcs[4024620] and dlcs[4572870],
+    "identity: bare DLC apps remain children of the keyed base")
+
+  local keyed, keyed_err = mp.resolve_lua_identity(
+    'addappid(701, 1, "' .. key .. '")', {})
+  check(keyed ~= nil and keyed_err == nil, "identity: single keyed depot is accepted")
+  eq(keyed and keyed.base, 701, "identity: single keyed declaration is the safe base")
+  eq(keyed and keyed.source, "keyed", "identity: keyed source is recorded")
+
+  local mismatch, mismatch_err = mp.resolve_lua_identity(luie, {
+    filename = "4024620.lua",
+  })
+  check(mismatch == nil and tostring(mismatch_err):find("conflicting", 1, true) ~= nil,
+    "identity: conflicting filename cannot turn a DLC into the base")
+
+  local ambiguous, ambiguous_err = mp.resolve_lua_identity(table.concat({
+    "addappid(900)",
+    'addappid(901, 1, "' .. key .. '")',
+    'addappid(902, 1, "' .. string.rep("c", 64) .. '")',
+  }, "\n"), {})
+  check(ambiguous == nil and tostring(ambiguous_err):find("ambiguous", 1, true) ~= nil,
+    "identity: multiple keyed candidates without a hint are rejected")
+end
+
 -- ── 2b. imported Lua merge + creator output ────────────────────────────────
 do
   local existing = table.concat({
@@ -148,7 +192,49 @@ do
   check(overflow_draft == nil, "draft: manifest gid above uint64 is rejected")
 end
 
--- ── 2c. strict binary manifest metadata ────────────────────────────────────
+-- ── 2c. reimport pin replacement and ownership validation ─────────────────
+do
+  local key = string.rep("d", 64)
+  local old = table.concat({
+    "addappid(700)",
+    'addappid(701,1,"' .. key .. '")',
+    'setManifestid(701,"9000")',
+    'setManifestid(702,"9002")',
+  }, "\n")
+  local incoming = table.concat({
+    "addappid(700)",
+    "addappid(703)",
+    'setManifestid(701,"9001")',
+  }, "\n")
+  local replaced, replace_err = mp.merge_lua_text_replacing_pins(700, old, incoming)
+  check(replaced ~= nil and replace_err == nil, "reimport: existing keys and DLCs merge")
+  local rp = mp.parse_lua(replaced or "")
+  eq(rp.depots[701] and rp.depots[701].manifestid, "9001",
+    "reimport: incoming pin replaces the old gid")
+  check(rp.depots[702] == nil or rp.depots[702].manifestid == nil,
+    "reimport: omitted old pin does not survive")
+  local rdlc = {}; for _, id in ipairs(rp.dlc_appids) do rdlc[id] = true end
+  check(rdlc[703], "reimport: useful new DLC declaration survives")
+
+  local collision = mp.inspect_import_entries({
+    { name = "100.lua", data = 'addappid(100)\naddappid(900,1,"' .. key .. '")\n' },
+    { name = "200.lua", data = 'addappid(200)\naddappid(900,1,"' .. string.rep("e", 64) .. '")\n' },
+  })
+  check(collision == nil, "ownership: one non-shared depot cannot belong to two apps")
+
+  local shared = mp.inspect_import_entries({
+    { name = "100.lua", data = 'addappid(100)\naddappid(228989,1,"' .. key .. '")\n' },
+    { name = "200.lua", data = 'addappid(200)\naddappid(228989,1,"' .. key .. '")\n' },
+  })
+  local orphan = mp.parse_lua('addappid(800)\nsetManifestid(801,"9001")\n')
+  local orphan_ok, orphan_errors = mp.validate_import_pins(orphan, {})
+  check(orphan_ok == false and #orphan_errors > 0,
+    "pins: an unkeyed, unarchived depot pin is rejected")
+  local archived_ok = mp.validate_import_pins(orphan, { ["801_9001"] = true })
+  check(archived_ok == true, "pins: an uploaded/archived manifest can authorize a keyless pin")
+end
+
+-- ── 2d. strict binary manifest metadata ────────────────────────────────────
 do
   local function section(magic, body)
     return string.pack("<I4I4", magic, #body) .. body
@@ -342,6 +428,32 @@ do
   check(body2:find("12345", 1, true) == nil, "rpc clear_dlc_pin: pin removed")
   check(body2:find("LogLevel: 2", 1, true) ~= nil, "rpc clear_dlc_pin: rest survives")
   os.remove(cfgpath)
+end
+
+-- ── 8a. ImportLuaFull rollback before publication ──────────────────────────
+do
+  local root = os.tmpname(); os.remove(root)
+  os.execute("mkdir -p '" .. root .. "/stplug-in'")
+  local old_path = root .. "/stplug-in/812.lua"
+  local old_lua = "addappid(812)\n"
+  local old_file = assert(io.open(old_path, "wb")); old_file:write(old_lua); old_file:close()
+  local ctx = {
+    config_path = root .. "/missing/config.yaml",
+    stplug_dir = root .. "/stplug-in",
+    manifests_dir = root .. "/manifests",
+  }
+  local incoming = 'addappid(812,1,"' .. string.rep("a", 64) .. '")\n'
+  local result = json.decode(mp.import_lua_full_rpc(ctx, json.encode({
+    appid = 812, lua = incoming,
+  })))
+  check(result.success == false,
+    "ImportLuaFull: missing config rejects the transaction")
+  local after_handle = assert(io.open(old_path, "rb"))
+  local after_file = after_handle:read("*a"); after_handle:close()
+  check(after_file == old_lua,
+    "ImportLuaFull: failed config validation leaves the old Lua untouched")
+  os.remove(old_path); os.execute("rmdir '" .. root .. "/stplug-in' 2>/dev/null")
+  os.execute("rmdir '" .. root .. "' 2>/dev/null")
 end
 
 -- ── 8b. workshop-depot detection (pure) ───────────────────────────────────
@@ -716,14 +828,17 @@ do
   check(ok == true, "delete: removes the spare version")
   check(not exists(mans .. "/800_300.manifest"), "delete: spare gone after")
 
-  -- clear_manifests: keeps installed (200) + pinned (100), removes the rest
-  --   (the orphan 999_777 and any other spares).
-  write_manifest(mans, 800, "300", 3000)  -- re-add a spare to be cleared
+  -- clear_manifests: keeps installed (200) + pinned (100), preserves every
+  -- archive whose depot is referenced by any Lua registration, and removes
+  -- unreferenced spares/orphans.
+  write_manifest(mans, 800, "300", 3000)  -- referenced depot: must stay
+  write_manifest(mans, 801, "300", 3000)  -- unreferenced spare: removable
   local removed = mp.clear_manifests(ctx)
-  check(removed >= 2, "clear: removed spares + orphan (got " .. tostring(removed) .. ")")
+  check(removed >= 2, "clear: removed unreferenced spare + orphan (got " .. tostring(removed) .. ")")
   check(exists(mans .. "/800_100.manifest"), "clear: KEEPS pinned 100")
   check(exists(mans .. "/800_200.manifest"), "clear: KEEPS installed 200")
-  check(not exists(mans .. "/800_300.manifest"), "clear: drops spare 300")
+  check(exists(mans .. "/800_300.manifest"), "clear: KEEPS referenced depot archives")
+  check(not exists(mans .. "/801_300.manifest"), "clear: drops unreferenced spare")
   check(not exists(mans .. "/999_777.manifest"), "clear: drops orphan 999")
   os.execute("rm -rf '" .. root .. "'")
 end
@@ -748,9 +863,9 @@ do
     "addappid(3357650)",
     "addappid(3859920)",
     "addappid(3859930)",
-    'addappid(3357651, 1, "18e75bfb")',
-    'addappid(3859920, 1, "1fb81184")',
-    'addappid(3859930, 1, "14001799")',
+    'addappid(3357651, 1, "' .. string.rep("a", 64) .. '")',
+    'addappid(3859920, 1, "' .. string.rep("b", 64) .. '")',
+    'addappid(3859930, 1, "' .. string.rep("c", 64) .. '")',
     'setManifestid(3357651, "2417499809052404547")',
     'setManifestid(3859920, "4731286747379700304")',
     'setManifestid(3859930, "6714427611547107917")',
@@ -797,7 +912,7 @@ do
 
   local lua = table.concat({
     "addappid(3357650)",
-    'addappid(3357651, 1, "key1")',
+    'addappid(3357651, 1, "' .. string.rep("a", 64) .. '")',
     'setManifestid(3357651, "2417499809052404547")',
   }, "\n")
 
@@ -821,7 +936,7 @@ do
   -- a .lua with NO setManifestid still imports the game (pinned=0, unlocked):
   -- the fallback path installs at latest. With no pins there is nothing to
   -- write to config.yaml, so it is left completely untouched.
-  local lua2 = "addappid(777)\naddappid(778,1,\"k\")\n"
+  local lua2 = "addappid(777)\naddappid(778,1,\"" .. string.rep("b", 64) .. "\")\n"
   local res2 = json.decode(mp.import_lua_full_rpc(ctx, json.encode({ lua = lua2 })))
   eq(res2.success, true, "full: no-pin .lua still imports")
   eq(res2.pinned, 0, "full: zero pins reported")
@@ -852,7 +967,7 @@ do
   local ctx = { config_path = cfg, steam_root = root,
                 stplug_dir = root .. "/stplug-in", manifests_dir = root .. "/manifests" }
 
-  local lua = 'addappid(700)\naddappid(701,1,"k")\nsetManifestid(701,"900")\n'
+  local lua = 'addappid(700)\naddappid(701,1,"' .. string.rep("a", 64) .. '")\nsetManifestid(701,"900")\n'
 
   local r1 = json.decode(mp.inspect_lua_rpc(ctx, json.encode({ lua = lua })))
   eq(r1.success, true, "inspect: success")
@@ -989,7 +1104,7 @@ do
 
   -- An imported game (via import_lua_full_rpc) gets marked; a DB-added game
   -- (written straight to stplug-in) does not.
-  local imported_lua = 'addappid(900)\naddappid(901,0,"k")\nsetManifestid(901,"111")\n'
+  local imported_lua = 'addappid(900)\naddappid(901,0,"' .. string.rep("a", 64) .. '")\nsetManifestid(901,"111")\n'
   local res = json.decode(mp.import_lua_full_rpc(ctx, json.encode({ lua = imported_lua })))
   eq(res.success, true, "imports: import_lua_full succeeds")
   write_manifest(mans, 901, "111", 1700000000)
@@ -1250,16 +1365,24 @@ do
 
   -- A Load-.lua game: full removal nukes manifests + .lua + AdditionalApps + marker.
   local lf = assert(io.open(stplug .. "/950.lua", "wb"))
-  lf:write('addappid(950)\naddappid(951,0,"k")\nsetManifestid(951,"500")\n'); lf:close()
+  lf:write('addappid(950)\naddappid(951,0,"k")\naddappid(228989,0,"k")\nsetManifestid(951,"500")\n'); lf:close()
   write_manifest(mans, 951, "500", D1)
   write_manifest(mans, 951, "600", D2)
+  write_manifest(mans, 228989, "700", D1)
+  -- A second registered app references the shared runtime depot. Full removal
+  -- of 950 must not delete that shared archive or data owned by the other app.
+  local other = assert(io.open(stplug .. "/960.lua", "wb"))
+  other:write('addappid(960)\naddappid(228989,0,"k")\n'); other:close()
   local cf2 = assert(io.open(cfg, "wb")); cf2:write("AdditionalApps:\n  - 900\n  - 950\nLogLevel: 2\n"); cf2:close()
   local imf = assert(io.open(imports, "wb")); imf:write("950\n"); imf:close()
 
   local r4 = json.decode(mp.delete_all_rpc(ctx, json.encode({ appid = 950 })))
   eq(r4.fullRemoval, true, "delall(lua): full removal")
-  eq(r4.removed, 2, "delall(lua): both manifests removed")
+  eq(r4.removed, 2, "delall(lua): only the target game's two content manifests removed")
   check(not exists(mans .. "/951_500.manifest"), "delall(lua): setManifestid manifest also removed")
+  check(not exists(mans .. "/951_600.manifest"), "delall(lua): spare target manifest removed")
+  check(exists(mans .. "/228989_700.manifest"),
+    "delall(lua): shared runtime manifest is preserved")
   check(not exists(stplug .. "/950.lua"), "delall(lua): .lua deleted")
   local cfg_after = io.open(cfg, "rb"):read("*a")
   check(not cfg_after:find("%- 950"), "delall(lua): dropped from AdditionalApps")
@@ -1267,12 +1390,121 @@ do
   check(not mp.parse_imports(io.open(imports, "rb") and io.open(imports, "rb"):read("*a") or "")[950],
         "delall(lua): import marker cleared")
 
-  -- clear_manifests keeps the LuaTools build (902_100 survived above; re-seed a spare).
+  -- clear_manifests keeps the LuaTools build and protects every depot still
+  -- referenced by a registered Lua file; an unrelated archive remains clearable.
   write_manifest(mans, 902, "700", D2)
+  write_manifest(mans, 999, "700", D2)
   local removed = select(1, mp.clear_manifests(ctx))
-  check(removed >= 1, "clear: removed at least the spare")
+  check(removed >= 1, "clear: removed an unreferenced spare")
   check(exists(mans .. "/902_100.manifest"), "clear: LuaTools build kept")
+  check(exists(mans .. "/902_700.manifest"), "clear: referenced depot archive kept")
+  check(not exists(mans .. "/999_700.manifest"), "clear: unrelated archive removed")
 
+  os.execute("rm -rf '" .. root .. "'")
+end
+
+-- ── 21. review regressions: lexical identity, Game Updates, full reimport,
+-- and global manifest cleanup protections ──────────────────────────────────
+do
+  local key = string.rep("a", 64)
+  local fake_header = table.concat({
+    "[=[",
+    "-- 999999 - fake header inside a long-bracket string",
+    "]=]",
+    'addappid(701,1,"' .. key .. '")',
+  }, "\n")
+  local resolved, identity_err = mp.resolve_lua_identity(fake_header, {})
+  check(resolved ~= nil and identity_err == nil and resolved.base == 701,
+    "identity: header text inside long-bracket content is ignored")
+end
+
+do
+  local key = string.rep("a", 64)
+  local function mkdir(path) os.execute("mkdir -p '" .. path .. "'") end
+  local function write_manifest(dir, depot, gid, created)
+    local pb = "\x08" .. varint(depot) .. "\x18" .. varint(created)
+    local block = "\xBE\x12\x48\x1F" .. string.pack("<I4", #pb) .. pb
+    local f = assert(io.open(dir .. "/" .. depot .. "_" .. gid .. ".manifest", "wb"))
+    f:write(string.rep("\0", 32) .. block); f:close()
+  end
+  local root = os.tmpname(); os.remove(root); mkdir(root)
+  local stplug, mans = root .. "/stplug-in", root .. "/manifests"
+  mkdir(stplug); mkdir(mans); mkdir(root .. "/steamapps")
+  local lf = assert(io.open(stplug .. "/3321460.lua", "wb"))
+  lf:write(table.concat({
+    'addappid(3321460,1,"' .. key .. '")',
+    'addappid(3321461,1,"' .. string.rep("b", 64) .. '")',
+    "addappid(4024620)",
+    "addappid(4572870)",
+  }, "\n")); lf:close()
+  write_manifest(mans, 3321460, "1", 1700000000)
+  local cfg = assert(io.open(root .. "/config.yaml", "wb")); cfg:write("LogLevel: 2\n"); cfg:close()
+  local games = mp.build_games({
+    config_path = root .. "/config.yaml", stplug_dir = stplug,
+    manifests_dir = mans, steam_root = root,
+  })
+  local dlcs = {}
+  for _, id in ipairs(games[1] and games[1].dlc_appids or {}) do dlcs[id] = true end
+  check(#games == 1 and dlcs[4024620] and dlcs[4572870],
+    "build: keyed base keeps all bare DLC apps in Game Updates")
+  os.execute("rm -rf '" .. root .. "'")
+end
+
+do
+  local function mkdir(path) os.execute("mkdir -p '" .. path .. "'") end
+  local key = string.rep("c", 64)
+  local root = os.tmpname(); os.remove(root); mkdir(root)
+  local stplug = root .. "/stplug-in"; mkdir(stplug)
+  local cfg = root .. "/config.yaml"
+  local cf = assert(io.open(cfg, "wb"))
+  cf:write(table.concat({
+    "AdditionalApps:", "  - 700", "ManifestPins:", "  700:",
+    "    locked: true", "    depots:", '      701: "9000"', "LogLevel: 2",
+  }, "\n")); cf:close()
+  local ctx = { config_path = cfg, stplug_dir = stplug }
+  local lua = 'addappid(700)\naddappid(701,1,"' .. key .. '")\n'
+  local result = json.decode(mp.import_lua_full_rpc(ctx, json.encode({
+    appid = 700, lua = lua,
+  })))
+  local pins = mp.parse_pins(io.open(cfg, "rb"):read("*a"))
+  check(result.success and result.pinned == 0 and pins[700] == nil,
+    "full reimport: omitted pins clear the previous app lock")
+  os.execute("rm -rf '" .. root .. "'")
+end
+
+do
+  local function mkdir(path) os.execute("mkdir -p '" .. path .. "'") end
+  local function write_manifest(dir, depot, gid, created)
+    local pb = "\x18" .. varint(created)
+    local block = "\xBE\x12\x48\x1F" .. string.pack("<I4", #pb) .. pb
+    local f = assert(io.open(dir .. "/" .. depot .. "_" .. gid .. ".manifest", "wb"))
+    f:write(string.rep("\0", 16) .. block); f:close()
+  end
+  local function exists(path)
+    local f = io.open(path, "rb")
+    if f then f:close(); return true end
+    return false
+  end
+  local root = os.tmpname(); os.remove(root); mkdir(root)
+  local stplug, mans = root .. "/stplug-in", root .. "/manifests"
+  mkdir(stplug); mkdir(mans); mkdir(root .. "/steamapps")
+  local function write_lua(name, text)
+    local f = assert(io.open(stplug .. "/" .. name .. ".lua", "wb")); f:write(text); f:close()
+  end
+  write_lua(600, 'addappid(600)\naddappid(800,0,"k")\n')
+  write_lua(601, 'addappid(601)\naddappid(1000,0,"k")\n')
+  write_lua(602, 'addappid(602)\naddappid(228989,0,"k")\n')
+  write_manifest(mans, 800, "1", 100)
+  write_manifest(mans, 1000, "1", 100)
+  write_manifest(mans, 228989, "1", 100)
+  local cfg = assert(io.open(root .. "/config.yaml", "wb")); cfg:write("LogLevel: 2\n"); cfg:close()
+  local ctx = { config_path = root .. "/config.yaml", stplug_dir = stplug,
+                manifests_dir = mans, steam_root = root }
+  mp.clear_manifests(ctx)
+  check(exists(mans .. "/1000_1.manifest"),
+    "clear: referenced depot archives are protected globally")
+  check(exists(mans .. "/228989_1.manifest"),
+    "clear: shared runtime archives are protected globally")
   os.execute("rm -rf '" .. root .. "'")
 end
 
