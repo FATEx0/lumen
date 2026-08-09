@@ -5,6 +5,7 @@ local socket = require("socket")
 local injector = require("injector")
 local lifecycle = require("lifecycle")
 local proc = require("proc")
+local webhelperwatch = require("webhelperwatch")
 local deskcover = require("deskcover")
 
 local loop = {}
@@ -29,6 +30,7 @@ function loop.run(opts)
   -- but tolerate slow boot (wait until Steam is first seen) and the restart gap
   -- (grace window). Liveness = the main `steam` client process in /proc.
   local watcher = lifecycle.new_watcher()
+  local webhelper_watcher = webhelperwatch.new()
   local CHECK_EVERY = 3          -- seconds between /proc liveness checks
   local next_check = 0
   -- Re-assert user-owned desktop coverage when the autostart entry appears or
@@ -64,8 +66,16 @@ function loop.run(opts)
         log("autostart entry changed/vanilla -> re-asserting desktop coverage")
         deskcover.run("--user")
       end
+      local steam_alive = proc.is_alive("steam")
       local should_exit, steam_returned =
-        watcher:should_exit(now, proc.is_alive("steam"))
+        watcher:should_exit(now, steam_alive)
+      if steam_returned then
+        webhelper_watcher:reset_session()
+      end
+      if webhelper_watcher:observe(
+          proc.is_alive("steamwebhelper"), steam_alive) then
+        log("WARN: " .. webhelper_watcher:warning_message())
+      end
       if steam_returned and type(opts.on_steam_returned) == "function" then
         local ok, err = pcall(opts.on_steam_returned)
         if not ok then
